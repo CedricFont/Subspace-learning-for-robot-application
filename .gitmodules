@@ -1,0 +1,3 @@
+[submodule "pbdlib-python"]
+	path = pbdlib-python
+	url = https://gitlab.idiap.ch/rli/pbdlib-python.git
