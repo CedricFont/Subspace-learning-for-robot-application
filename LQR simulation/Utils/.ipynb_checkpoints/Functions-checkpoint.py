@@ -4,10 +4,15 @@ def RK4(func, X0, u, t):
     """
     Runge and Kutta 4 integrator.
     """
-    dt = t[1] - t[0]
-    nt = len(t)
-    X  = np.zeros([len(X0), nt])
+    if t.shape[0] == 1:
+        dt = t
+        nt = 2
+    else :
+        dt = t[1] - t[0]
+        nt = len(t)
+    X  = np.empty([len(X0), nt])
     X[:,0] = X0
+    
     for i in range(nt-1):
         
         k1 = func(X[:,i], t[i], u[i])
