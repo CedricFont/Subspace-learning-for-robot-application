@@ -45,7 +45,7 @@ def discreteSimulation(A, B, X0, u, t):
     return X
 
 def pseudoInverse(X):
-    return (X.T@X)@X.T
+    return inv(X.T@X)@X.T
 
 class SimplePendulum:
     """
@@ -84,24 +84,16 @@ class DelayedLeastSquare:
         self.N = self.X.shape[1] # Total number of data per state
         self.A, self.B = None, None # Linear dynamics matrices
         
-#     @property
-#     def A(self):
-#         return self._A
-    
-#     @A.setter
-#     def A(self, value):
-#         self._A = value
-        
     def solve(self):
-        Y = self.X[:,self.N - self.H:self.N]
+        Y = np.flip(self.X[:,self.N - self.H:self.N]).T 
         Phi = np.empty([self.H,(self.nb_S + self.nb_U)*self.D])
         
         # TODO : implement for multi-input
         for i in range(self.D):
-            Phi[:,i*self.nb_S:(i+1)*self.nb_S] = self.X[:,self.N-self.H-i-1:self.N-i-1] # States
-            Phi[:,self.nb_S*self.D+i:self.nb_S*self.D+i+self.nb_U] = self.U[self.N-self.H-i-1:self.N-i-1]
+            Phi[:,i*self.nb_S:(i+1)*self.nb_S] = np.flip(self.X[:,self.N-self.H-i-1:self.N-i-1],axis=1).T # States
+            Phi[:,self.nb_S*self.D+i] = np.flip(self.U[self.N-self.H-i-1:self.N-i-1])
             
-        X = (inv(pseudoInverse(Phi)@Y)).T
-        self.A, self.B = X[:,0:self.nb_S], X[:,self.D*self.S]
+        X = (pseudoInverse(Phi)@Y).T
+        self.A, self.B = X[:,0:self.nb_S], X[:,self.D*self.nb_S]
              
 
