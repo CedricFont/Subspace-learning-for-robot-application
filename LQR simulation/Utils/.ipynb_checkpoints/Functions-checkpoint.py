@@ -1,4 +1,5 @@
 import numpy as np
+from numpy.linalg import inv
 
 def RK4(func, X0, u, t):
     """
@@ -43,6 +44,9 @@ def discreteSimulation(A, B, X0, u, t):
         
     return X
 
+def pseudoInverse(X):
+    return (X.T@X)@X.T
+
 class SimplePendulum:
     """
     Defines a simple pendulum object
@@ -52,7 +56,7 @@ class SimplePendulum:
         self.l = length
         self.g = 9.81
     
-    X = [] # Trajectory from a simulation
+    X = None # Trajectory from a simulation
     X0 = [] # IC for simulation
     U = [] # Input for a simulation (torque)
     T = [] # Time vector for a simulation
@@ -64,4 +68,40 @@ class SimplePendulum:
         dx1dt = x2
         dx2dt = 2/(self.m*self.l**2)*(u - self.m*self.g*np.sin(x1))
         return np.array([dx1dt, dx2dt])
+    
+class DelayedLeastSquare:
+    """
+    Defines a delay embedded version of a least square problem
+    for linear dynamics discovery
+    """
+    def __init__(self, data, tau, horizon, u, nb_u):
+        self.H = horizon
+        self.D = tau # Maximum delay
+        self.X = data # Observation matrix
+        self.U = u
+        self.nb_S = self.X.shape[0] # Number of states
+        self.nb_U = nb_u # Number of control inputs
+        self.N = self.X.shape[1] # Total number of data per state
+        self.A, self.B = None, None # Linear dynamics matrices
+        
+#     @property
+#     def A(self):
+#         return self._A
+    
+#     @A.setter
+#     def A(self, value):
+#         self._A = value
+        
+    def solve(self):
+        Y = self.X[:,self.N - self.H:self.N]
+        Phi = np.empty([self.H,(self.nb_S + self.nb_U)*self.D])
+        
+        # TODO : implement for multi-input
+        for i in range(self.D):
+            Phi[:,i*self.nb_S:(i+1)*self.nb_S] = self.X[:,self.N-self.H-i-1:self.N-i-1] # States
+            Phi[:,self.nb_S*self.D+i:self.nb_S*self.D+i+self.nb_U] = self.U[self.N-self.H-i-1:self.N-i-1]
+            
+        X = (inv(pseudoInverse(Phi)@Y)).T
+        self.A, self.B = X[:,0:self.nb_S], X[:,self.D*self.S]
+             
 
