@@ -5,7 +5,7 @@ def RK4(func, X0, u, t, type=None):
     """
     Runge and Kutta 4 integrator.
     """
-    if len(t) == 1:
+    if isinstance(t, np.ndarray) == False:
         dt = t
         nt = 2
     else :
@@ -21,6 +21,13 @@ def RK4(func, X0, u, t, type=None):
             k3 = func(X[:,i] + dt/2. * k2, u(X, i))
             k4 = func(X[:,i] + dt    * k3, u(X, i))
             X[:,i+1] = X[:,i] + dt / 6. * (k1 + 2. * k2 + 2. * k3 + k4)
+    elif type == 'controller-step-by-step':
+        for i in range(nt-1):
+            k1 = func(X0, u)
+            k2 = func(X0 + dt/2. * k1, u)
+            k3 = func(X0 + dt/2. * k2, u)
+            k4 = func(X0 + dt    * k3, u)
+            X = X0 + dt / 6. * (k1 + 2. * k2 + 2. * k3 + k4)
     else:
         for i in range(nt-1):
             k1 = func(X[:,i], u[i])
@@ -85,7 +92,31 @@ def PD(X, i, r, K, Td, dt):
     if i == 0:
         return K*(r - X[:,i])
     else:
-        return K*(r - X[:,i]) + Td*(X[:,i] - X[:,i-1])/dt 
+        return K*(r - X[:,i]) + K*Td*(-X[:,i] + X[:,i-1])/dt 
+    
+def PID(X, i, r, K, Td, dt):
+    if i == 0:
+        return K*(r - X[:,i])
+    else:
+        return K*(r - X[:,i]) + K*Td*(X[:,i] - X[:,i-1])/dt 
+    
+def squareReference(N, T, L):
+    """
+    Creates a square signal for reference tracking.
+    N -> nb of time-steps
+    T -> period of oscillation (in number of time-steps)
+    L -> levels of the square reference
+    """
+    count = 0
+    r = L[0]
+    signal = np.empty(shape=[N])
+    for i in range(N):
+        if i % T == 0:
+            count +=1
+            r = L[count%2] # Oscillates between 0 and 1
+        signal[i] = r
+    return signal
+            
 
 class SimplePendulum:
     """
@@ -101,9 +132,10 @@ class SimplePendulum:
     U = [] # Input for a simulation (torque)
     T = [] # Time vector for a simulation
     dt = 1e-2 # Time-step for simulation
+    N = len(T)
     
     def dynamics(self, theta, u):
-        if u.ndim == 2:
+        if isinstance(u, np.ndarray) == True:
             u = u[1]
         x1 = theta[0]
         x2 = theta[1]
