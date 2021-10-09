@@ -100,23 +100,38 @@ def PID(X, i, r, K, Td, dt):
     else:
         return K*(r - X[:,i]) + K*Td*(X[:,i] - X[:,i-1])/dt 
     
-def squareReference(N, T, L):
+def squareReference(N, T, L, delay_precision=0, precision_percentage=0):
     """
     Creates a square signal for reference tracking.
     N -> nb of time-steps
     T -> period of oscillation (in number of time-steps)
     L -> levels of the square reference
     """
-    count = 0
+    count, delay_count = 0, delay_precision
     r = L[0]
-    signal = np.empty(shape=[N])
+    signal, precision = np.empty(shape=[N]), np.empty(shape=[N])
     for i in range(N):
         if i % T == 0:
             count +=1
             r = L[count%2] # Oscillates between 0 and 1
-        signal[i] = r
-    return signal
-            
+            delay_count = 0
+            precision[i-np.int(delay_precision/10):i] = precision_percentage
+        signal[i], delay_count = r, delay_count+1
+        if delay_count < delay_precision: precision[i] = precision_percentage # Lower percentage of the precision
+        else: precision[i] = 1 # 100% of the tracking precision
+    return signal, precision
+
+def sineReference(N, T, A):
+    """
+    Creates a sinusoidal reference for tracking
+    N -> nb. of time-steps
+    T -> period of the sin
+    L-> low and high amplitudes
+    """
+    if A[0] != A[1]:
+        offset = (A[0] + A[1])/2
+        amplitude = (A[1] - A[0])/2
+    return [amplitude*np.sin(2*np.pi*i/T) + offset for i in range(N)]     
 
 class SimplePendulum:
     """
@@ -133,6 +148,7 @@ class SimplePendulum:
     T = [] # Time vector for a simulation
     dt = 1e-2 # Time-step for simulation
     N = len(T)
+    ref = None
     
     def dynamics(self, theta, u):
         if isinstance(u, np.ndarray) == True:
@@ -142,6 +158,17 @@ class SimplePendulum:
         dx1dt = x2
         dx2dt = 2/(self.m*self.l**2)*(u - self.m*self.g*np.sin(x1))
         return np.array([dx1dt, dx2dt])
+    
+    def dynamicsDelayed(self, theta, u, tau):
+        if isinstance(u, np.ndarray) == True:
+            u = u[1]
+        output = np.zeros(shape=[2*tau])
+        x1 = theta[0]
+        x2 = theta[1]
+        dx1dt = x2
+        dx2dt = 2/(self.m*self.l**2)*(u - self.m*self.g*np.sin(x1))
+        output[0:2] = np.array((dx1dt,dx2dt))
+        return output
     
 class DelayedLeastSquare:
     """
