@@ -44,7 +44,7 @@ def delayEmbeddedSimulation(A, B, X0, U, system_size=2):
     return : trajectory vector X
     """
     nb_delays = np.int(A.shape[1]/system_size - 1)
-    N = len(U) # Simulation duration
+    N = len(U)+1 # Simulation duration
     X = np.empty(shape=[system_size,N])
     X[:,0] = X0
     X_line = np.empty(shape=[np.int(system_size*(nb_delays+1))]) # Line vector for multiplying the extended A matrix
@@ -94,11 +94,12 @@ def PD(X, i, r, K, Td, dt):
     else:
         return K*(r - X[:,i]) + K*Td*(-X[:,i] + X[:,i-1])/dt 
     
-def PID(X, i, r, K, Td, dt):
+def PID(X, i, r, K, Td, Ti, dt, t_max):
     if i == 0:
-        return K*(r - X[:,i])
+        return K*(r - X[:,i]) + K/Ti*(np.sum(r - X[:,0:i]))*dt
     else:
-        return K*(r - X[:,i]) + K*Td*(X[:,i] - X[:,i-1])/dt 
+        if i <= t_max: t_max = 0
+        return K*(r - X[:,i]) + K*Td*(X[:,i] - X[:,i-1])/dt + K/Ti*(np.sum(r - X[:,i-t_max:i]))*dt
     
 def squareReference(N, T, L, delay_precision=0, precision_percentage=0):
     """
@@ -115,7 +116,7 @@ def squareReference(N, T, L, delay_precision=0, precision_percentage=0):
             count +=1
             r = L[count%2] # Oscillates between 0 and 1
             delay_count = 0
-            precision[i-np.int(delay_precision/10):i] = precision_percentage
+            precision[i] = precision_percentage
         signal[i], delay_count = r, delay_count+1
         if delay_count < delay_precision: precision[i] = precision_percentage # Lower percentage of the precision
         else: precision[i] = 1 # 100% of the tracking precision
@@ -148,7 +149,7 @@ class SimplePendulum:
     T = [] # Time vector for a simulation
     dt = 1e-2 # Time-step for simulation
     N = len(T)
-    ref = None
+    ref, ref_T = None, None
     
     def dynamics(self, theta, u):
         if isinstance(u, np.ndarray) == True:
@@ -184,26 +185,40 @@ class DelayedLeastSquare:
         self.nb_U = nb_u # Number of control inputs
         self.N = self.X.shape[1] # Total number of data per state
         self.A, self.B = None, None # Linear dynamics matrices
-        self.Traj = None # Vector for storing the whole trajectory
+        self.Traj, self.S, self.S_y = None, None, None # Vector for storing the whole trajectory and Hankel matrix sigma SVD matrix
+        self.precision = None
+        self.Y, self.Phi = None, None
         
-    def solve(self):
-        Y = self.X[:,self.N - self.H:self.N].T 
-#         Phi = np.empty([self.H,(self.nb_S + self.nb_U)*self.D])
-        Phi = np.empty([self.H,self.nb_S*self.D+1])
+    def matricesConstruction(self):
+        self.Y = self.X[:,self.N - self.H:self.N].T 
+        self.Phi = np.empty([self.H,self.nb_S*self.D+1])
         
-        # TODO : implement for multi-input
         for i in range(self.D):
-            Phi[:,i*self.nb_S:(i+1)*self.nb_S] = self.X[:,self.N-self.H-i-1:self.N-i-1].T # States
-#             Phi[:,self.nb_S*self.D+i] = self.U[self.N-self.H-i-1:self.N-i-1]
-        Phi[:,self.nb_S*self.D] = self.U[self.N-self.H-1:self.N-1]
-            
-#         U, S, V_T = svd(Phi, full_matrices=True)
-#         X = V*np.multiply(U.T*Y,np.reciprocal(S))
-        X, residuals, _, _ = lstsq(Phi,Y,rcond=None)
+            self.Phi[:,i*self.nb_S:(i+1)*self.nb_S] = self.X[:,self.N-self.H-i-1:self.N-i-1].T # States
+        self.Phi[:,self.nb_S*self.D] = self.U[self.N-self.H-1:self.N-1] # Inputs
+    
+    # SVD decompositions for low rank approximation
+    def SVD(self):
+        self.matricesConstruction()
+        U, self.S, V_T = svd(self.Phi, full_matrices=False)
+        U_y, self.S_y, V_y = svd(self.Y, full_matrices=False)
+        
+#     def truncate(self, p):
+#         U, self.S, V_T = svd(Phi, full_matrices=False)
+#         U_zilda, S_zilda, V_zilda = U[:,0:p], self.S[0:p], V_T.T[:,0:p]
+#         Y, Phi = self.matricesConstruction()
+#         self.A_p = Y@V_zilda.T@inv(np.diag(S_zilda))@U_zilda.T
+        
+    def solve(self, truncation=False):
+        self.matricesConstruction()
+        X, residuals, _, _ = lstsq(self.Phi,self.Y,rcond=None)
         X = X.T
         self.A, self.B = X[:,0:self.nb_S*self.D], X[:,self.D*self.nb_S:(self.nb_S + self.nb_U)*self.D]
         
     def computeTrajectory(self, X0, U, system_size=2):
         self.Traj = delayEmbeddedSimulation(self.A, self.B, X0, U, system_size=2)
+        
+    def computePrecision(self, original_trajectory):
+        self.precision = np.sum(np.sqrt(np.square((original_trajectory-self.Traj))),axis=1)
              
 
