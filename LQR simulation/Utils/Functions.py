@@ -187,17 +187,10 @@ class DelayedLeastSquare:
         self.N = self.X.shape[1] # Total number of data per state
         self.A, self.B = None, None # Linear dynamics matrices
         self.A_p, self.B_p = None, None # Linear dynamics matrices
+        self.A_y, self.B_y = None, None # Linear dynamics matrices
         self.Traj, self.S, self.S_y = None, None, None # Vector for storing the whole trajectory and Hankel matrix sigma SVD matrix
-        self.precision = None
+        self.precision, self.optimal_truncation = None, None
         self.Y, self.Phi = None, None
-        
-#     def matricesConstruction(self):
-#         self.Y = self.X[:,self.N - self.H:self.N].T 
-#         self.Phi = np.empty([self.H,self.nb_S*self.D+1])
-        
-#         for i in range(self.D):
-#             self.Phi[:,i*self.nb_S:(i+1)*self.nb_S] = self.X[:,self.N-self.H-i-1:self.N-i-1].T # States
-#         self.Phi[:,self.nb_S*self.D] = self.U[self.N-self.H-1:self.N-1] # Inputs
         
     def matricesConstruction(self):
         self.Phi = np.empty(shape=[self.H,self.nb_S*self.tau + 1]) # +1 for the input column
@@ -211,12 +204,20 @@ class DelayedLeastSquare:
         self.Phi = self.Phi.T
     
     # SVD decompositions for low rank approximation
-    def SVD(self):
+    def SVD(self, truncation_ratio=.9):
         self.matricesConstruction()
         U, self.S, V_T = svd(self.Phi, full_matrices=False)
         U_y, self.S_y, V_y = svd(self.Y, full_matrices=False)
+        self.SVD_OptimalTruncationValue(truncation_ratio)
         
-    def truncate(self, rank, keep_matrices=True):
+    def SVD_OptimalTruncationValue(self, truncation_ratio):
+        SVD_sum = np.sum(self.S)
+        for i in range(len(self.S)):
+            if np.sum(self.S[:i]/SVD_sum) > truncation_ratio:
+                self.optimal_truncation = i+1
+                return 
+        
+    def truncate(self, rank, keep_matrices=True, double_SVD=False, rank2=0):
         self.matricesConstruction()
         U, self.S, V_T = svd(self.Phi, full_matrices=False)
         U_zilda, S_zilda, V_zilda = U[:,0:rank], self.S[0:rank], V_T.T[:,0:rank]
@@ -224,6 +225,12 @@ class DelayedLeastSquare:
         self.A_p, self.B_p = self.Y@V_zilda@inv(np.diag(S_zilda))@U_1.T, self.Y@V_zilda@inv(np.diag(S_zilda))@U_2.T
         
         if keep_matrices: self.A, self.B = self.A_p, self.B_p
+            
+        if double_SVD:
+            U_y, self.S_y, V_y = svd(self.Y, full_matrices=False)
+            U_zilda_y, S_zilda_y, V_zilda_y = U[:,0:rank2], self.S[0:rank2], V_T.T[:,0:rank2]
+            self.A_y, self.B_y = U_zilda_y.T@self.A_p@U_zilda_y, U_zilda_y.T@self.B_p
+            if keep_matrices: self.A, self.B = self.A_y, self.B_y
         
     def solve(self, truncation=False):
         self.matricesConstruction()
@@ -231,9 +238,8 @@ class DelayedLeastSquare:
         X = X.T
         self.A, self.B = X[:,0:self.nb_S*self.tau], X[:,self.tau*self.nb_S:]
         
-    def computeTrajectory(self, X0, U, system_size=2, low_rank=False):
-        if low_rank: self.Traj = delayEmbeddedSimulation(self.A_p, self.B_p, X0, U, system_size=2)
-        else: self.Traj = delayEmbeddedSimulation(self.A, self.B, X0, U, system_size=2)
+    def computeTrajectory(self, X0, U, system_size=2):
+        self.Traj = delayEmbeddedSimulation(self.A, self.B, X0, U, system_size=2)
         
     def computePrecision(self, original_trajectory):
         self.precision = np.sum(np.sqrt(np.square((original_trajectory-self.Traj))),axis=1)
