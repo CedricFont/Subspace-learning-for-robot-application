@@ -1,5 +1,6 @@
 import numpy as np
 from numpy.linalg import inv, svd, lstsq
+from scipy import linalg as slg
 
 def RK4(func, X0, u, t, type=None):
     """
@@ -178,24 +179,36 @@ class DelayedLeastSquare:
     """
     def __init__(self, data, tau, horizon, u, nb_u):
         self.H = horizon
-        self.D = tau # Maximum delay
+        self.tau = tau # Maximum delay
         self.X = data # Observation matrix
         self.U = u
         self.nb_S = self.X.shape[0] # Number of states
         self.nb_U = nb_u # Number of control inputs
         self.N = self.X.shape[1] # Total number of data per state
         self.A, self.B = None, None # Linear dynamics matrices
+        self.A_p, self.B_p = None, None # Linear dynamics matrices
         self.Traj, self.S, self.S_y = None, None, None # Vector for storing the whole trajectory and Hankel matrix sigma SVD matrix
         self.precision = None
         self.Y, self.Phi = None, None
         
-    def matricesConstruction(self):
-        self.Y = self.X[:,self.N - self.H:self.N].T 
-        self.Phi = np.empty([self.H,self.nb_S*self.D+1])
+#     def matricesConstruction(self):
+#         self.Y = self.X[:,self.N - self.H:self.N].T 
+#         self.Phi = np.empty([self.H,self.nb_S*self.D+1])
         
-        for i in range(self.D):
-            self.Phi[:,i*self.nb_S:(i+1)*self.nb_S] = self.X[:,self.N-self.H-i-1:self.N-i-1].T # States
-        self.Phi[:,self.nb_S*self.D] = self.U[self.N-self.H-1:self.N-1] # Inputs
+#         for i in range(self.D):
+#             self.Phi[:,i*self.nb_S:(i+1)*self.nb_S] = self.X[:,self.N-self.H-i-1:self.N-i-1].T # States
+#         self.Phi[:,self.nb_S*self.D] = self.U[self.N-self.H-1:self.N-1] # Inputs
+        
+    def matricesConstruction(self):
+        self.Phi = np.empty(shape=[self.H,self.nb_S*self.tau + 1]) # +1 for the input column
+        self.Y = self.X[:,self.N - self.H:self.N]
+        
+        for delay in range(self.tau):
+            self.Phi[:,delay*self.nb_S:(delay+1)*self.nb_S] = self.X[:,self.N - self.H - delay - 1:self.N - delay - 1].T
+            
+        self.Phi[:,self.tau*self.nb_S] = self.U[self.N - self.H - 1:self.N - 1] # Input
+        
+        self.Phi = self.Phi.T
     
     # SVD decompositions for low rank approximation
     def SVD(self):
@@ -203,20 +216,24 @@ class DelayedLeastSquare:
         U, self.S, V_T = svd(self.Phi, full_matrices=False)
         U_y, self.S_y, V_y = svd(self.Y, full_matrices=False)
         
-#     def truncate(self, p):
-#         U, self.S, V_T = svd(Phi, full_matrices=False)
-#         U_zilda, S_zilda, V_zilda = U[:,0:p], self.S[0:p], V_T.T[:,0:p]
-#         Y, Phi = self.matricesConstruction()
-#         self.A_p = Y@V_zilda.T@inv(np.diag(S_zilda))@U_zilda.T
+    def truncate(self, rank, keep_matrices=True):
+        self.matricesConstruction()
+        U, self.S, V_T = svd(self.Phi, full_matrices=False)
+        U_zilda, S_zilda, V_zilda = U[:,0:rank], self.S[0:rank], V_T.T[:,0:rank]
+        U_1, U_2 = U_zilda[0:self.nb_S*self.tau,:], U_zilda[self.nb_S*self.tau,:]
+        self.A_p, self.B_p = self.Y@V_zilda@inv(np.diag(S_zilda))@U_1.T, self.Y@V_zilda@inv(np.diag(S_zilda))@U_2.T
+        
+        if keep_matrices: self.A, self.B = self.A_p, self.B_p
         
     def solve(self, truncation=False):
         self.matricesConstruction()
         X, residuals, _, _ = lstsq(self.Phi,self.Y,rcond=None)
         X = X.T
-        self.A, self.B = X[:,0:self.nb_S*self.D], X[:,self.D*self.nb_S:(self.nb_S + self.nb_U)*self.D]
+        self.A, self.B = X[:,0:self.nb_S*self.tau], X[:,self.tau*self.nb_S:]
         
-    def computeTrajectory(self, X0, U, system_size=2):
-        self.Traj = delayEmbeddedSimulation(self.A, self.B, X0, U, system_size=2)
+    def computeTrajectory(self, X0, U, system_size=2, low_rank=False):
+        if low_rank: self.Traj = delayEmbeddedSimulation(self.A_p, self.B_p, X0, U, system_size=2)
+        else: self.Traj = delayEmbeddedSimulation(self.A, self.B, X0, U, system_size=2)
         
     def computePrecision(self, original_trajectory):
         self.precision = np.sum(np.sqrt(np.square((original_trajectory-self.Traj))),axis=1)
