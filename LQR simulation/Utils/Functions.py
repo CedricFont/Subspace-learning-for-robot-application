@@ -95,12 +95,12 @@ def PD(X, i, r, K, Td, dt):
     else:
         return K*(r - X[:,i]) + K*Td*(-X[:,i] + X[:,i-1])/dt 
     
-def PID(X, i, r, K, Td, Ti, dt, t_max):
+def PID(X, i, r, K, Kd, Ki, dt, t_max):
     if i == 0:
         return K*(r - X[:,i]) + K/Ti*(np.sum(r - X[:,0:i]))*dt
     else:
         if i <= t_max: t_max = 0
-        return K*(r - X[:,i]) + K*Td*(X[:,i] - X[:,i-1])/dt + K/Ti*(np.sum(r - X[:,i-t_max:i]))*dt
+        return K*(r - X[:,i]) - Kd*(X[:,i] - X[:,i-1])/dt + Ki*(np.sum(r - X[:,i-t_max:i]))*dt
     
 def squareReference(N, T, L, delay_precision=0, precision_percentage=0):
     """
@@ -219,6 +219,7 @@ class DelayedLeastSquare:
         
     def truncate(self, rank, keep_matrices=True, double_SVD=False, rank2=0):
         self.matricesConstruction()
+        if rank == 0: rank = self.Phi.shape[0]
         U, self.S, V_T = svd(self.Phi, full_matrices=False)
         U_zilda, S_zilda, V_zilda = U[:,0:rank], self.S[0:rank], V_T.T[:,0:rank]
         U_1, U_2 = U_zilda[0:self.nb_S*self.tau,:], U_zilda[self.nb_S*self.tau,:]
