@@ -1,6 +1,7 @@
 import numpy as np
 from numpy.linalg import inv, svd, lstsq
 from scipy import linalg as slg
+import pbdlib as pbd
 
 def RK4(func, X0, u, t, type=None):
     """
@@ -97,10 +98,10 @@ def PD(X, i, r, K, Td, dt):
     
 def PID(X, i, r, K, Kd, Ki, dt, t_max):
     if i == 0:
-        return K*(r - X[:,i]) + K/Ti*(np.sum(r - X[:,0:i]))*dt
+        return K*(r - X[:,i]) + Ki*(np.sum(r - X[:,0:i]))*dt
     else:
         if i <= t_max: t_max = 0
-        return K*(r - X[:,i]) - Kd*(X[:,i] - X[:,i-1])/dt + Ki*(np.sum(r - X[:,i-t_max:i]))*dt
+        return K*(r - X[:,i]) + Kd*(X[:,i] - X[:,i-1])/dt + Ki*(np.sum(r - X[:,i-t_max:i]))*dt
     
 def squareReference(N, T, L, delay_precision=0, precision_percentage=0):
     """
@@ -139,17 +140,17 @@ class SimplePendulum:
     """
     Defines a simple pendulum object
     """
-    def __init__(self, mass, length):
+    def __init__(self, mass, length, time, X0, dt=1e-2):
         self.m = mass
         self.l = length
         self.g = 9.81
-    
-    X = None # Trajectory from a simulation
-    X0 = [] # IC for simulation
-    U = [] # Input for a simulation (torque)
-    T = [] # Time vector for a simulation
-    dt = 1e-2 # Time-step for simulation
-    N = len(T)
+        self.T = time
+        self.N = len(self.T)
+        self.X, self.X0 = np.empty(shape=[2,self.N]), X0
+        self.X[:,0] = X0
+        self.U = np.empty(self.N-1)
+        self.dt = dt
+        
     ref, ref_T = None, None
     
     def dynamics(self, theta, u):
@@ -229,7 +230,7 @@ class DelayedLeastSquare:
             
         if double_SVD:
             U_y, self.S_y, V_y = svd(self.Y, full_matrices=False)
-            U_zilda_y, S_zilda_y, V_zilda_y = U[:,0:rank2], self.S[0:rank2], V_T.T[:,0:rank2]
+            U_zilda_y, S_zilda_y, V_zilda_y = U_y[:,0:rank2], self.S_y[0:rank2], V_y.T[:,0:rank2]
             self.A_y, self.B_y = U_zilda_y.T@self.A_p@U_zilda_y, U_zilda_y.T@self.B_p
             if keep_matrices: self.A, self.B = self.A_y, self.B_y
         
@@ -243,6 +244,57 @@ class DelayedLeastSquare:
         self.Traj = delayEmbeddedSimulation(self.A, self.B, X0, U, system_size=2)
         
     def computePrecision(self, original_trajectory):
-        self.precision = np.sum(np.sqrt(np.square((original_trajectory-self.Traj))),axis=1)
+        self.precision = np.sqrt(np.sum(np.square((original_trajectory-self.Traj)),axis=1))
              
+class LQR_Transform:
+    """
+    Facilitates the transformation of a delay-embedded system into a LQR
+    form
+    """
+    def __init__(self,dynamics_instance,object_instance):
+        self.tau = dynamics_instance.tau
+        self.nb_states = dynamics_instance.nb_S
+        self.A_before, self.B_before = dynamics_instance.A, dynamics_instance.B
+        self.A, self.B = np.zeros(shape=[2*self.tau,2*self.tau]), np.zeros(shape=[2*self.tau])
+        self.dynamics, self.object = dynamics_instance, object_instance
+        
+    def LQR_Instance(self):
+        self.A[0:2,:], self.A[2:2*self.tau,0:2*self.tau-2] = self.A_before, np.eye(2*self.tau-2)
+        self.B[0:2] = self.B_before[0]
+        self.B = self.B[:,np.newaxis]
+        self.LQR = pbd.LQR(self.A, self.B, nb_dim=self.A.shape[0], dt=self.object.dt, horizon=self.object.N)
+        
+    def LQR_setParameters(self,u_std,x_std):
+        self.LQR_trackingTrajectory()
+        self.LQR_costDefinition(u_std,x_std)
+        
+    def LQR_trackingTrajectory(self):
+        # Trajectory for tracking
+        tracking_traj = np.zeros(shape=[self.object.N,2*self.tau]) # Vector for storing the trajectory
+        tracking_traj[:,0] = self.object.ref
+        self.LQR.z = tracking_traj
 
+        # Trajectory timing (1 via-point = 1 time-step, should be as long as the horizon)
+        seq_tracking = 1*[0]
+
+        for i in range(1,self.object.N):
+            seq_tracking += (1)*[i]
+
+        self.LQR.seq_xi = seq_tracking
+        
+    def LQR_costDefinition(self,u_std,x_std):
+        # Control precision 
+        self.LQR.gmm_u = u_std
+
+        # Tracking precision
+        Q_tracking = np.zeros(shape=[self.object.N,2*self.tau,2*self.tau])
+
+        for i in range(self.object.N):
+            Q_tracking[i,0:2,0:2] = np.diag([x_std,0]) # Put zero velocity precision
+
+        self.LQR.Q = Q_tracking
+        
+    def LQR_rollout(self,X0):
+        xs, us = self.LQR.make_rollout(X0)
+        self.xs_mean = np.mean(xs, axis=0)
+        self.xs_std  = np.std(xs, axis=0)
