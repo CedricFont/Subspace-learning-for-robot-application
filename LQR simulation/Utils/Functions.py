@@ -147,11 +147,11 @@ class SimplePendulum:
         self.T = time
         self.N = len(self.T)
         self.X, self.X0 = np.empty(shape=[2,self.N]), X0
-        self.X[:,0] = X0
-        self.U = np.empty(self.N-1)
+        self.X[:,0], self.X_ref2 = X0, np.empty(shape=[self.N,2])
+        self.U, self.U2 = np.empty(self.N-1), np.empty(self.N-1)
         self.dt = dt
         
-    ref, ref_T = None, None
+    ref, ref2 = None, None
     
     def dynamics(self, theta, u):
         if isinstance(u, np.ndarray) == True:
@@ -192,11 +192,17 @@ class DelayedLeastSquare:
         self.Traj, self.S, self.S_y = None, None, None # Vector for storing the whole trajectory and Hankel matrix sigma SVD matrix
         self.precision, self.optimal_truncation = None, None
         self.Y, self.Phi = None, None
+        self.residuals = np.empty(shape=[2,1])
         
     def matricesConstruction(self):
+        """
+        self.H -> time horizon
+        self.N -> total number of time-steps gathered from simulation
+        """
         self.Phi = np.empty(shape=[self.H,self.nb_S*self.tau + 1]) # +1 for the input column
         self.Y = self.X[:,self.N - self.H:self.N]
         
+        # Stack shifted state vectors from most recent to most ancient
         for delay in range(self.tau):
             self.Phi[:,delay*self.nb_S:(delay+1)*self.nb_S] = self.X[:,self.N - self.H - delay - 1:self.N - delay - 1].T
             
@@ -234,17 +240,23 @@ class DelayedLeastSquare:
             self.A_y, self.B_y = U_zilda_y.T@self.A_p@U_zilda_y, U_zilda_y.T@self.B_p
             if keep_matrices: self.A, self.B = self.A_y, self.B_y
         
-    def solve(self, truncation=False):
+    def solve(self, truncation_ratio=.95):
         self.matricesConstruction()
-        X, residuals, _, _ = lstsq(self.Phi,self.Y,rcond=None)
-        X = X.T
-        self.A, self.B = X[:,0:self.nb_S*self.tau], X[:,self.tau*self.nb_S:]
+        self.X, _, _, _ = lstsq(self.Phi.T,self.Y.T,rcond=truncation_ratio)
+        self.X = self.X.T
+        self.A, self.B = self.X[:,0:self.nb_S*self.tau], self.X[:,self.tau*self.nb_S:]
+        
+        self.computeResiduals() # least square resiudas
         
     def computeTrajectory(self, X0, U, system_size=2):
         self.Traj = delayEmbeddedSimulation(self.A, self.B, X0, U, system_size=2)
         
     def computePrecision(self, original_trajectory):
         self.precision = np.sqrt(np.sum(np.square((original_trajectory-self.Traj)),axis=1))
+        
+    def computeResiduals(self):
+        self.residuals[0] = np.sum(np.square(self.Y.T[:,0] - self.Phi.T@self.X.T[:,0])) # Position residuals
+        self.residuals[1] = np.sum(np.square(self.Y.T[:,1] - self.Phi.T@self.X.T[:,1])) # Velocity residuals
              
 class LQR_Transform:
     """
@@ -284,6 +296,7 @@ class LQR_Transform:
         
     def LQR_costDefinition(self,u_std,x_std):
         # Control precision 
+        self.u_std = u_std
         self.LQR.gmm_u = u_std
 
         # Tracking precision
@@ -296,5 +309,20 @@ class LQR_Transform:
         
     def LQR_rollout(self,X0):
         xs, us = self.LQR.make_rollout(X0)
-        self.xs_mean = np.mean(xs, axis=0)
+        self.X = np.mean(xs, axis=0)
+        self.us = np.mean(us, axis=0)
         self.xs_std  = np.std(xs, axis=0)
+        
+    def LQR_cost(self,X,U,ref):
+        Qu = np.diag(np.ones(self.dynamics.N-1)*self.u_std)
+        Q_tracking_modified = self.LQR.Q[:,0:self.nb_states-1,0:self.nb_states-1]
+        
+        cost_X = 0
+        for i in range(self.dynamics.N):
+            cost_X += (X[0,i] - ref[i]).T*Q_tracking_modified[i,0,0]*(X[0,i] - ref[i])
+        
+        self.J = U.T@Qu@U + cost_X
+        return self.J
+    
+    def LQR_getK(self):
+        self.K = np.array(self.LQR.K)[:,0,:]
