@@ -1,5 +1,5 @@
 import numpy as np
-from numpy.linalg import inv, svd, lstsq
+from numpy.linalg import inv, svd, lstsq, pinv
 from scipy import linalg as slg
 import pbdlib as pbd
 
@@ -96,12 +96,17 @@ def PD(X, i, r, K, Td, dt):
     else:
         return K*(r - X[:,i]) + K*Td*(-X[:,i] + X[:,i-1])/dt 
     
-def PID(X, i, r, K, Kd, Ki, dt, t_max):
+# TODO : make the limit more general
+def PID(X, i, r, K, Kd, Ki, dt, t_max, limit):
     if i == 0:
-        return K*(r - X[:,i]) + Ki*(np.sum(r - X[:,0:i]))*dt
+        U = K*(r - X[:,i]) + Ki*(np.sum(r - X[:,0:i]))*dt
+        if U[0] > limit: U[0] = limit
+        return U
     else:
         if i <= t_max: t_max = 0
-        return K*(r - X[:,i]) + Kd*(X[:,i] - X[:,i-1])/dt + Ki*(np.sum(r - X[:,i-t_max:i]))*dt
+        U = K*(r - X[:,i]) + Kd*(X[:,i] - X[:,i-1])/dt + Ki*(np.sum(r - X[:,i-t_max:i]))*dt
+        if U[0] > limit: U[0] = limit
+        return U
     
 def squareReference(N, T, L, delay_precision=0, precision_percentage=0):
     """
@@ -124,17 +129,41 @@ def squareReference(N, T, L, delay_precision=0, precision_percentage=0):
         else: precision[i] = 1 # 100% of the tracking precision
     return signal, precision
 
-def sineReference(N, T, A):
+def sineReference(N, dt, T, A, offset, varying=False, freq_vector=None, amp_vector=None):
     """
     Creates a sinusoidal reference for tracking
     N -> nb. of time-steps
     T -> period of the sin
-    L-> low and high amplitudes
+    L -> low and high amplitudes
+    varying -> creates time varying frequency and amplitude
+    BEWARE : the nb of items in freq_vector & amp_vector must be a integer fraction of N
     """
-    if A[0] != A[1]:
-        offset = (A[0] + A[1])/2
-        amplitude = (A[1] - A[0])/2
-    return [amplitude*np.sin(2*np.pi*i/T) + offset for i in range(N)]     
+    if varying:
+        nbf, nba = N/len(freq_vector), N/len(amp_vector)
+        freq, amp = -1, -1
+        sine = np.empty(shape=[N])
+        for i in range(N):
+            if i%nbf == 0: freq += 1
+            if i%nba == 0: amp += 1
+            sine[i] = deg2rad(amp_vector[amp])*np.sin(2*np.pi*i/freq2period(freq_vector[freq],dt)) + deg2rad(offset)
+    else:
+        sine = [deg2rad(A*np.sin(2*np.pi*i/T)) + deg2rad(offset) for i in range(N)] 
+    return sine 
+
+# def multSine(freq):
+#     nb_freq = len()
+#     for i in range(i):
+        
+
+def freq2period(freq, dt):
+    return 1/freq/dt
+
+def inline(V):
+    Vp = np.empty(shape=[V.shape[0]*V.shape[1]])
+    n = V.shape[0]
+    for i in range(V.shape[1]):
+        Vp[i*n:(i+1)*n] = V[:,i]
+    return Vp
 
 class SimplePendulum:
     """
@@ -257,7 +286,39 @@ class DelayedLeastSquare:
     def computeResiduals(self):
         self.residuals[0] = np.sum(np.square(self.Y.T[:,0] - self.Phi.T@self.X.T[:,0])) # Position residuals
         self.residuals[1] = np.sum(np.square(self.Y.T[:,1] - self.Phi.T@self.X.T[:,1])) # Velocity residuals
-             
+        
+class HAVOK:
+    """
+    Defines all necessary methods to identify a system using input and state measurement data
+    """
+    def __init__(self, X, U):
+        self.X = X
+        self.U = U
+        self.N = X.shape[1] # Total number of points
+        self.nb_S = X.shape[0] # Number of states
+        self.nb_U = U.shape[0] # Number of control inputs
+        
+        
+    def HANKEL(self, horizon):
+        self.n_h = horizon # Number of points in one trajectory
+        self.H = np.empty(shape=[self.n_h*self.nb_S,self.N-self.n_h])
+        for i in range(self.N-self.n_h):
+            self.H[:,i] = inline(self.X[:,i:i+self.n_h]).T
+            
+    def SVD(self, tau):
+        self.tau = tau # Number of embedded delays desired
+        self.u, self.s, self.v = svd(self.H)
+        # Restrict to desired subspace
+        self.u, self.s, self.v = self.u[:,:self.tau], self.s[:self.tau], self.v[:,:self.tau]
+        self.Y = self.v.T
+        self.C = self.u[0:2,:]@np.diag(self.s) # Mapping between subspace and original space
+        
+    def LS(self):
+        Y_cut = self.Y[:,:self.Y.shape[1]-1]
+        self.YU = np.concatenate((Y_cut,self.U[:Y_cut.shape[1],np.newaxis].T), axis=0)
+        AB = self.Y[:,1:self.Y.shape[1]]@pinv(self.YU)
+        self.A, self.B = AB[:,:self.tau], AB[:,self.tau:AB.shape[1]]
+              
 class LQR_Transform:
     """
     Facilitates the transformation of a delay-embedded system into a LQR
