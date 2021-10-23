@@ -298,7 +298,6 @@ class HAVOK:
         self.nb_S = X.shape[0] # Number of states
         self.nb_U = U.shape[0] # Number of control inputs
         
-        
     def HANKEL(self, horizon):
         self.n_h = horizon # Number of points in one trajectory
         self.H = np.empty(shape=[self.n_h*self.nb_S,self.N-self.n_h])
@@ -307,17 +306,33 @@ class HAVOK:
             
     def SVD(self, tau):
         self.tau = tau # Number of embedded delays desired
-        self.u, self.s, self.v = svd(self.H)
+        self.u, self.s, self.vh = svd(self.H)
+        self.v = self.vh.T
         # Restrict to desired subspace
         self.u, self.s, self.v = self.u[:,:self.tau], self.s[:self.tau], self.v[:,:self.tau]
         self.Y = self.v.T
-        self.C = self.u[0:2,:]@np.diag(self.s) # Mapping between subspace and original space
+        self.C = self.u[0:self.nb_S,:]@np.diag(self.s) # Mapping between subspace and original space
         
     def LS(self):
         Y_cut = self.Y[:,:self.Y.shape[1]-1]
         self.YU = np.concatenate((Y_cut,self.U[:Y_cut.shape[1],np.newaxis].T), axis=0)
         AB = self.Y[:,1:self.Y.shape[1]]@pinv(self.YU)
+        self.LS_residuals(AB)
         self.A, self.B = AB[:,:self.tau], AB[:,self.tau:AB.shape[1]]
+        
+    def Simulate(self, X0):
+        Y0 = pinv(self.C)@X0
+        N = np.eye(self.tau) - pinv(self.C) @ self.C # Nullspace projection operator
+        Y0 = Y0 + N @ (self.Y[:,1] - Y0) # Corresponding position in subspace
+
+        Y_traj = np.empty(shape=[self.tau,self.N])
+        Y_traj[:,0] = Y0
+        for i in range(self.N-1):
+            Y_traj[:,i+1] = self.A@Y_traj[:,i] + self.B[:,0]*self.U[i]
+        self.X_traj = self.C@Y_traj
+        
+    def LS_residuals(self, AB):
+        self.residuals = np.sum(np.square(self.C@(AB@self.YU - self.Y[:,1:self.Y.shape[1]])),axis=1)
               
 class LQR_Transform:
     """
