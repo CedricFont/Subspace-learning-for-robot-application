@@ -323,13 +323,13 @@ class HAVOK:
     def Simulate(self, X0):
         Y0 = pinv(self.C)@X0
         N = np.eye(self.tau) - pinv(self.C) @ self.C # Nullspace projection operator
-        Y0 = Y0 + N @ (self.Y[:,1] - Y0) # Corresponding position in subspace
+        Y0 = Y0 + N @ (self.Y[:,0] - Y0) # Corresponding position in subspace
 
-        Y_traj = np.empty(shape=[self.tau,self.N])
-        Y_traj[:,0] = Y0
+        self.Y_traj = np.empty(shape=[self.tau,self.N])
+        self.Y_traj[:,0] = Y0
         for i in range(self.N-1):
-            Y_traj[:,i+1] = self.A@Y_traj[:,i] + self.B[:,0]*self.U[i]
-        self.X_traj = self.C@Y_traj
+            self.Y_traj[:,i+1] = self.A@self.Y_traj[:,i] + self.B[:,0]*self.U[i]
+        self.X_traj = self.C@self.Y_traj
         
     def LS_residuals(self, AB):
         self.residuals = np.sum(np.square(self.C@(AB@self.YU - self.Y[:,1:self.Y.shape[1]])),axis=1)
