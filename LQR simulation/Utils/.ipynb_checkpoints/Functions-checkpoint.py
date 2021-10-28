@@ -320,7 +320,9 @@ class HAVOK:
         self.LS_residuals(AB)
         self.A, self.B = AB[:,:self.tau], AB[:,self.tau:AB.shape[1]]
         
-    def Simulate(self, X0):
+    def Simulate(self, X0, U_testing=None):
+        if U_testing is None: U = self.U
+        else: U = U_testing
         Y0 = pinv(self.C)@X0
         N = np.eye(self.tau) - pinv(self.C) @ self.C # Nullspace projection operator
         Y0 = Y0 + N @ (self.Y[:,0] - Y0) # Corresponding position in subspace
@@ -328,11 +330,56 @@ class HAVOK:
         self.Y_traj = np.empty(shape=[self.tau,self.N])
         self.Y_traj[:,0] = Y0
         for i in range(self.N-1):
-            self.Y_traj[:,i+1] = self.A@self.Y_traj[:,i] + self.B[:,0]*self.U[i]
+            self.Y_traj[:,i+1] = self.A@self.Y_traj[:,i] + self.B[:,0]*U[i]
         self.X_traj = self.C@self.Y_traj
         
     def LS_residuals(self, AB):
         self.residuals = np.sum(np.square(self.C@(AB@self.YU - self.Y[:,1:self.Y.shape[1]])),axis=1)
+        
+    def ConstructLQR(self, x_std, u_std, dt, ref, custom_trajectory=None):
+        self.u_std, self.x_std = u_std, x_std
+        
+        # Build LQR problem instance
+        self.LQR = pbd.LQR(self.A, self.B, nb_dim=self.tau, dt=dt, horizon=self.N)
+
+        # Reference tracking
+        reference = np.zeros([self.N,self.nb_S])
+        reference[:,0] = ref 
+
+        self.LQR.z = (pinv(self.C)@reference.T).T
+
+        # Trajectory timing (1 via-point = 1 time-step, should be as long as the horizon)
+        seq_tracking = 1*[0]
+
+        for i in range(1,self.N):
+            seq_tracking += (1)*[i]
+
+        self.LQR.seq_xi = seq_tracking
+
+        # Control precision 
+        u_std = 2. # means 1e-3
+        self.LQR.gmm_u = u_std
+
+        # Tracking precision
+        x_std = 1e6 # Importance of tracking the position
+        Q_tracking = np.empty(shape=[self.N,self.tau,self.tau])
+
+        for i in range(self.N):
+            Q_tracking[i,:,:] = self.C.T@np.diag([x_std,0])@self.C # Put zero velocity precision
+
+        self.LQR.Q = Q_tracking
+        self.LQR.ricatti()
+        
+    def LQR_cost(self, X, U, ref):
+        Qu = np.diag(np.ones(self.N-1)*self.u_std)
+        Q_tracking_modified = self.LQR.Q[:,0:self.nb_S-1,0:self.nb_S-1]
+        
+        cost_X = 0
+        for i in range(self.N):
+            cost_X += (X[0,i] - ref[i]).T*Q_tracking_modified[i,0,0]*(X[0,i] - ref[i])
+        
+        self.J = U.T@Qu@U + cost_X
+        return self.J
               
 class LQR_Transform:
     """
