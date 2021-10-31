@@ -97,16 +97,22 @@ def PD(X, i, r, K, Td, dt):
         return K*(r - X[:,i]) + K*Td*(-X[:,i] + X[:,i-1])/dt 
     
 # TODO : make the limit more general
-def PID(X, i, r, K, Kd, Ki, dt, t_max, limit):
-    if i == 0:
-        U = K*(r - X[:,i]) + Ki*(np.sum(r - X[:,0:i]))*dt
-        if U[0] > limit: U[0] = limit
-        return U
+def PID(X, i, r, K, Kd, Ki, dt, t_max, limit, type=None, integral=None):
+    if type == 'std':
+        error = r - X[:,i]
+        integral = integral + error*dt
+        U = K*error + Kd*(X[:,i] - X[:,i-1])/dt + Ki*integral
+        return U, integral
     else:
-        if i <= t_max: t_max = 0
-        U = K*(r - X[:,i]) + Kd*(X[:,i] - X[:,i-1])/dt + Ki*(np.sum(r - X[:,i-t_max:i]))*dt
-        if U[0] > limit: U[0] = limit
-        return U
+        if i == 0:
+            U = K*(r - X[:,i]) + Ki*(np.sum(r - X[:,0:i]))*dt
+            if U[0] > limit: U[0] = limit
+            return U
+        else:
+            if i <= t_max: t_max = 0
+            U = K*(r - X[:,i]) - Kd*(X[:,i] - X[:,i-1])/dt + Ki*(np.sum(r - X[:,i-t_max:i]))*dt
+            if U[0] > limit: U[0] = limit
+            return U
     
 def squareReference(N, T, L, delay_precision=0, precision_percentage=0):
     """
@@ -369,6 +375,16 @@ class HAVOK:
 
         self.LQR.Q = Q_tracking
         self.LQR.ricatti()
+        
+    def LQR_simulate(self, X0):
+        N = np.eye(self.tau) - pinv(self.C)@self.C # Nullspace projection operator
+        Y0 = np.zeros((1,self.tau))
+        Y0[0,:] = pinv(self.C)@X0 + N@(self.Y[:,0] - pinv(self.C)@X0)
+        ys, us = self.LQR.make_rollout(Y0)
+        ys_mean = np.mean(ys, axis=0)
+        xs = self.C@ys_mean.T # Map back to original space
+        xs = xs.T
+        self.LQR_X = xs
         
     def LQR_cost(self, X, U, ref):
         Qu = np.diag(np.ones(self.N-1)*self.u_std)
