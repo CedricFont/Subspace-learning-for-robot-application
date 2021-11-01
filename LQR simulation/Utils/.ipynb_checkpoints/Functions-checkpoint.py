@@ -349,8 +349,11 @@ class HAVOK:
         self.LQR = pbd.LQR(self.A, self.B, nb_dim=self.tau, dt=dt, horizon=self.N)
 
         # Reference tracking
-        reference = np.zeros([self.N,self.nb_S])
-        reference[:,0] = ref 
+        if custom_trajectory is not None:
+            reference = ref
+        else:
+            reference = np.zeros([self.N,self.nb_S])
+            reference[:,0] = ref 
 
         self.LQR.z = (pinv(self.C)@reference.T).T
 
@@ -371,7 +374,11 @@ class HAVOK:
         Q_tracking = np.empty(shape=[self.N,self.tau,self.tau])
 
         for i in range(self.N):
-            Q_tracking[i,:,:] = self.C.T@np.diag([x_std,0])@self.C # Put zero velocity precision
+            if custom_trajectory is not None:
+                cost = custom_trajectory[:,i]
+            else:
+                cost = np.array([x_std,0])
+            Q_tracking[i,:,:] = self.C.T@np.diag(cost)@self.C # Put zero velocity precision
 
         self.LQR.Q = Q_tracking
         self.LQR.ricatti()
@@ -380,7 +387,7 @@ class HAVOK:
         N = np.eye(self.tau) - pinv(self.C)@self.C # Nullspace projection operator
         Y0 = np.zeros((1,self.tau))
         Y0[0,:] = pinv(self.C)@X0 + N@(self.Y[:,0] - pinv(self.C)@X0)
-        ys, us = self.LQR.make_rollout(Y0)
+        ys, self.LQR_U = self.LQR.make_rollout(Y0)
         ys_mean = np.mean(ys, axis=0)
         xs = self.C@ys_mean.T # Map back to original space
         xs = xs.T
