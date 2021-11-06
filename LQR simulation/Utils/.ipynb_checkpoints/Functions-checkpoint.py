@@ -155,10 +155,6 @@ def sineReference(N, dt, T, A, offset, varying=False, freq_vector=None, amp_vect
     else:
         sine = [deg2rad(A*np.sin(2*np.pi*i/T)) + deg2rad(offset) for i in range(N)] 
     return sine 
-
-# def multSine(freq):
-#     nb_freq = len()
-#     for i in range(i):
         
 
 def freq2period(freq, dt):
@@ -194,7 +190,8 @@ class SimplePendulum:
         x1 = theta[0]
         x2 = theta[1]
         dx1dt = x2
-        dx2dt = 2/(self.m*self.l**2)*(u - self.m*self.g*np.sin(x1))
+#         dx2dt = 2/(self.m*self.l**2)*(u - self.m*self.g*np.sin(x1))
+        dx2dt = -self.g/self.l*np.cos(x1) + u/(self.m*self.l**2)
         return np.array([dx1dt, dx2dt])
     
     def dynamicsDelayed(self, theta, u, tau):
@@ -312,17 +309,22 @@ class HAVOK:
             
     def SVD(self, tau):
         self.tau = tau # Number of embedded delays desired
-        self.u, self.s, self.vh = svd(self.H)
+        self.u, self.s, self.vh = svd(self.H, full_matrices=False)
+        self.sigma = self.s
         self.v = self.vh.T
         # Restrict to desired subspace
         self.u, self.s, self.v = self.u[:,:self.tau], self.s[:self.tau], self.v[:,:self.tau]
         self.Y = self.v.T
         self.C = self.u[0:self.nb_S,:]@np.diag(self.s) # Mapping between subspace and original space
         
-    def LS(self):
+    def LS(self, p):
         Y_cut = self.Y[:,:self.Y.shape[1]-1]
         self.YU = np.concatenate((Y_cut,self.U[:Y_cut.shape[1],np.newaxis].T), axis=0)
-        AB = self.Y[:,1:self.Y.shape[1]]@pinv(self.YU)
+#         u, s, vt = svd(self.YU)
+#         u, s, vt = u[:,:p], s[:p], vt[:p,:]
+        Y = self.Y[:,1:self.Y.shape[1]]
+        AB = Y@pinv(self.YU)
+#         AB = Y@vt.T@inv(np.diag(s))@u.T
         self.LS_residuals(AB)
         self.A, self.B = AB[:,:self.tau], AB[:,self.tau:AB.shape[1]]
         
@@ -366,7 +368,6 @@ class HAVOK:
         self.LQR.seq_xi = seq_tracking
 
         # Control precision 
-        u_std = 2. # means 1e-3
         self.LQR.gmm_u = u_std
 
         # Tracking precision
