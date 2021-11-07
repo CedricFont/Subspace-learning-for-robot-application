@@ -403,6 +403,7 @@ class HAVOK:
             cost_X += (X[0,i] - ref[i]).T*Q_tracking_modified[i,0,0]*(X[0,i] - ref[i])
         
         self.J = U.T@Qu@U + cost_X
+        self.xQx, self.uRu = cost_X, U.T@Qu@U
         return self.J
               
 class LQR_Transform:
