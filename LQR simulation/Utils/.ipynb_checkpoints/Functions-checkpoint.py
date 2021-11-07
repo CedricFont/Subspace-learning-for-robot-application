@@ -155,7 +155,20 @@ def sineReference(N, dt, T, A, offset, varying=False, freq_vector=None, amp_vect
     else:
         sine = [deg2rad(A*np.sin(2*np.pi*i/T)) + deg2rad(offset) for i in range(N)] 
     return sine 
+
+def varSine(amp, freq, nb_periods, offset, dt):
+    periods = np.reciprocal(freq)/dt # period of each sinusoid
+    duration = np.multiply(periods,nb_periods) # nb of time steps for each sinusoid
+    N = len(amp)
+    sine = []
+    
+    for i in range(N):
+        sine_storage = np.empty(shape=np.int(duration[i]))
+        for j in range(np.int(duration[i])):
+            sine_storage[j] = deg2rad(amp[i])*np.sin(2*np.pi/periods[i]*j) + deg2rad(offset[i])
+        sine = np.hstack((sine,sine_storage))
         
+    return sine
 
 def freq2period(freq, dt):
     return 1/freq/dt
@@ -302,10 +315,16 @@ class HAVOK:
         self.nb_U = U.shape[0] # Number of control inputs
         
     def HANKEL(self, horizon):
+#         self.n_h = horizon # Number of points in one trajectory
+#         self.H = np.empty(shape=[self.n_h*self.nb_S,self.N-self.n_h])
+#         for i in range(self.N-self.n_h):
+#             self.H[:,i] = inline(self.X[:,i:i+self.n_h]).T
         self.n_h = horizon # Number of points in one trajectory
-        self.H = np.empty(shape=[self.n_h*self.nb_S,self.N-self.n_h])
-        for i in range(self.N-self.n_h):
-            self.H[:,i] = inline(self.X[:,i:i+self.n_h]).T
+        self.H = np.empty(shape=[self.nb_S*self.n_h,self.N-self.n_h])
+#         self.H = np.empty(shape=[self.n_h,self.N-self.n_h])
+#         self.X = np.sin(self.X)
+        for i in range(self.n_h):
+            self.H[self.nb_S*i:self.nb_S*(i+1),:] = self.X[:,i:self.N - self.n_h + i]
             
     def SVD(self, tau):
         self.tau = tau # Number of embedded delays desired
@@ -323,8 +342,10 @@ class HAVOK:
 #         u, s, vt = svd(self.YU)
 #         u, s, vt = u[:,:p], s[:p], vt[:p,:]
         Y = self.Y[:,1:self.Y.shape[1]]
-        AB = Y@pinv(self.YU)
+#         AB = Y@pinv(self.YU)
 #         AB = Y@vt.T@inv(np.diag(s))@u.T
+        AB, self.res, _, _ = lstsq(self.YU.T,Y.T,rcond=None)
+        AB = AB.T
         self.LS_residuals(AB)
         self.A, self.B = AB[:,:self.tau], AB[:,self.tau:AB.shape[1]]
         
@@ -333,7 +354,7 @@ class HAVOK:
         else: U = U_testing
         Y0 = pinv(self.C)@X0
         N = np.eye(self.tau) - pinv(self.C) @ self.C # Nullspace projection operator
-        Y0 = Y0 + N @ (self.Y[:,0] - Y0) # Corresponding position in subspace
+#         Y0 = Y0 + N @ (self.Y[:,0] - Y0) # Corresponding position in subspace
 
         self.Y_traj = np.empty(shape=[self.tau,self.N])
         self.Y_traj[:,0] = Y0
