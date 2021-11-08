@@ -2,6 +2,7 @@ import numpy as np
 from numpy.linalg import inv, svd, lstsq, pinv
 from scipy import linalg as slg
 import pbdlib as pbd
+import matplotlib.pyplot as plt
 
 def RK4(func, X0, u, t, type=None):
     """
@@ -315,16 +316,25 @@ class HAVOK:
         self.nb_U = U.shape[0] # Number of control inputs
         
     def HANKEL(self, horizon):
-#         self.n_h = horizon # Number of points in one trajectory
-#         self.H = np.empty(shape=[self.n_h*self.nb_S,self.N-self.n_h])
-#         for i in range(self.N-self.n_h):
-#             self.H[:,i] = inline(self.X[:,i:i+self.n_h]).T
         self.n_h = horizon # Number of points in one trajectory
-        self.H = np.empty(shape=[self.nb_S*self.n_h,self.N-self.n_h])
+        self.H = np.empty(shape=[self.n_h*self.nb_S,self.N-self.n_h])
+        for i in range(self.N-self.n_h):
+            self.H[:,i] = inline(self.X[:,i:i+self.n_h]).T
+#             self.H[0::2,i] = self.X[0,i:i+self.n_h].T
+#             self.H[1::2,i] = self.X[1,i:i+self.n_h].T
+        # Using only 1 state for learning
+#         self.H = np.empty(shape=[self.n_h,self.N-self.n_h])
+#         for i in range(self.N-self.n_h):
+#             self.H[:,i] = self.X[0,i:i+self.n_h].T
+#         self.n_h = horizon # Number of points in one trajectory
+#         self.H = np.empty(shape=[self.nb_S*self.n_h,self.N-self.n_h])
+#         self.H = np.empty(shape=[self.nb_S*(self.N-self.n_h),self.n_h])
 #         self.H = np.empty(shape=[self.n_h,self.N-self.n_h])
 #         self.X = np.sin(self.X)
-        for i in range(self.n_h):
-            self.H[self.nb_S*i:self.nb_S*(i+1),:] = self.X[:,i:self.N - self.n_h + i]
+#         for i in range(self.n_h):
+#             self.H[self.nb_S*i:self.nb_S*(i+1),:] = self.X[:,i:self.N - self.n_h + i]
+#         for i in range(self.n_h):
+#             self.H[:,i] = inline(self.X[:,i:self.N - self.n_h + i]).T
             
     def SVD(self, tau):
         self.tau = tau # Number of embedded delays desired
@@ -336,7 +346,7 @@ class HAVOK:
         self.Y = self.v.T
         self.C = self.u[0:self.nb_S,:]@np.diag(self.s) # Mapping between subspace and original space
         
-    def LS(self, p):
+    def LS(self, p, rcond=None):
         Y_cut = self.Y[:,:self.Y.shape[1]-1]
         self.YU = np.concatenate((Y_cut,self.U[:Y_cut.shape[1],np.newaxis].T), axis=0)
 #         u, s, vt = svd(self.YU)
@@ -344,7 +354,7 @@ class HAVOK:
         Y = self.Y[:,1:self.Y.shape[1]]
 #         AB = Y@pinv(self.YU)
 #         AB = Y@vt.T@inv(np.diag(s))@u.T
-        AB, self.res, _, _ = lstsq(self.YU.T,Y.T,rcond=None)
+        AB, self.res, _, _ = lstsq(self.YU.T,Y.T,rcond)
         AB = AB.T
         self.LS_residuals(AB)
         self.A, self.B = AB[:,:self.tau], AB[:,self.tau:AB.shape[1]]
@@ -354,7 +364,7 @@ class HAVOK:
         else: U = U_testing
         Y0 = pinv(self.C)@X0
         N = np.eye(self.tau) - pinv(self.C) @ self.C # Nullspace projection operator
-#         Y0 = Y0 + N @ (self.Y[:,0] - Y0) # Corresponding position in subspace
+        Y0 = Y0 + N @ (self.Y[:,0] - Y0) # Corresponding position in subspace
 
         self.Y_traj = np.empty(shape=[self.tau,self.N])
         self.Y_traj[:,0] = Y0
@@ -365,17 +375,19 @@ class HAVOK:
     def LS_residuals(self, AB):
         self.residuals = np.sum(np.square(self.C@(AB@self.YU - self.Y[:,1:self.Y.shape[1]])),axis=1)
         
-    def ConstructLQR(self, x_std, u_std, dt, ref, custom_trajectory=None):
+    def ConstructLQR(self, x_std, u_std, dt, ref, horizon=None, custom_trajectory=None):
         self.u_std, self.x_std = u_std, x_std
+        if horizon is not None: N = horizon
+        else: N = self.N
         
         # Build LQR problem instance
-        self.LQR = pbd.LQR(self.A, self.B, nb_dim=self.tau, dt=dt, horizon=self.N)
+        self.LQR = pbd.LQR(self.A, self.B, nb_dim=self.tau, dt=dt, horizon=N)
 
         # Reference tracking
         if custom_trajectory is not None:
             reference = ref
         else:
-            reference = np.zeros([self.N,self.nb_S])
+            reference = np.zeros([N,self.nb_S])
             reference[:,0] = ref 
 
         self.LQR.z = (pinv(self.C)@reference.T).T
@@ -383,7 +395,7 @@ class HAVOK:
         # Trajectory timing (1 via-point = 1 time-step, should be as long as the horizon)
         seq_tracking = 1*[0]
 
-        for i in range(1,self.N):
+        for i in range(1,N):
             seq_tracking += (1)*[i]
 
         self.LQR.seq_xi = seq_tracking
@@ -393,9 +405,9 @@ class HAVOK:
 
         # Tracking precision
         x_std = 1e6 # Importance of tracking the position
-        Q_tracking = np.empty(shape=[self.N,self.tau,self.tau])
+        Q_tracking = np.empty(shape=[N,self.tau,self.tau])
 
-        for i in range(self.N):
+        for i in range(N):
             if custom_trajectory is not None:
                 cost = custom_trajectory[:,i]
             else:
@@ -415,12 +427,15 @@ class HAVOK:
         xs = xs.T
         self.LQR_X = xs
         
-    def LQR_cost(self, X, U, ref):
-        Qu = np.diag(np.ones(self.N-1)*self.u_std)
+    def LQR_cost(self, X, U, ref, horizon=None):
+        if horizon is not None: N = horizon
+        else: N = self.N
+            
+        Qu = np.diag(np.ones(N-1)*self.u_std)
         Q_tracking_modified = self.LQR.Q[:,0:self.nb_S-1,0:self.nb_S-1]
         
         cost_X = 0
-        for i in range(self.N):
+        for i in range(N):
             cost_X += (X[0,i] - ref[i]).T*Q_tracking_modified[i,0,0]*(X[0,i] - ref[i])
         
         self.J = U.T@Qu@U + cost_X
@@ -495,3 +510,15 @@ class LQR_Transform:
     
     def LQR_getK(self):
         self.K = np.array(self.LQR.K)[:,0,:]
+        
+def plot_robot(xs, color='k', xlim=None,ylim=None, **kwargs):
+
+	l = plt.plot(xs[0,:], xs[1,:], marker='o', color=color, lw=10, mfc='w', solid_capstyle='round',
+			 **kwargs)
+
+	plt.axes().set_aspect('equal')
+
+	if xlim is not None: plt.xlim(xlim)
+	if ylim is not None: plt.ylim(ylim)
+
+	return l
