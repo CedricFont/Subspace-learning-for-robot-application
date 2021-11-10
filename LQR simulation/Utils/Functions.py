@@ -1,6 +1,7 @@
 import numpy as np
-from numpy.linalg import inv, svd, lstsq, pinv
+from numpy.linalg import inv, lstsq, pinv
 from scipy import linalg as slg
+from scipy.linalg import svd
 import pbdlib as pbd
 import matplotlib.pyplot as plt
 
@@ -107,12 +108,14 @@ def PID(X, i, r, K, Kd, Ki, dt, t_max, limit, type=None, integral=None):
     else:
         if i == 0:
             U = K*(r - X[:,i]) + Ki*(np.sum(r - X[:,0:i]))*dt
-            if U[0] > limit: U[0] = limit
+            if U[0] > limit[1]: U[0] = limit[1]
+            if U[0] < limit[0]: U[0] = limit[0]
             return U
         else:
             if i <= t_max: t_max = 0
             U = K*(r - X[:,i]) - Kd*(X[:,i] - X[:,i-1])/dt + Ki*(np.sum(r - X[:,i-t_max:i]))*dt
-            if U[0] > limit: U[0] = limit
+            if U[0] > limit[1]: U[0] = limit[1]
+            if U[0] < limit[0]: U[0] = limit[0]
             return U
     
 def squareReference(N, T, L, delay_precision=0, precision_percentage=0):
@@ -317,34 +320,48 @@ class HAVOK:
         
     def HANKEL(self, horizon):
         self.n_h = horizon # Number of points in one trajectory
-        self.H = np.empty(shape=[self.n_h*self.nb_S,self.N-self.n_h])
-        for i in range(self.N-self.n_h):
-            self.H[:,i] = inline(self.X[:,i:i+self.n_h]).T
+#         self.H = np.empty(shape=[self.n_h*self.nb_S,self.N-self.n_h])
+        # My original way ##########################################################
+#         for i in range(self.N-self.n_h):
+#             self.H[:,i] = inline(self.X[:,i:i+self.n_h]).T
 #             self.H[0::2,i] = self.X[0,i:i+self.n_h].T
 #             self.H[1::2,i] = self.X[1,i:i+self.n_h].T
-        # Using only 1 state for learning
+        # Using only 1 state for learning ##########################################
 #         self.H = np.empty(shape=[self.n_h,self.N-self.n_h])
 #         for i in range(self.N-self.n_h):
 #             self.H[:,i] = self.X[0,i:i+self.n_h].T
-#         self.n_h = horizon # Number of points in one trajectory
-#         self.H = np.empty(shape=[self.nb_S*self.n_h,self.N-self.n_h])
+        
 #         self.H = np.empty(shape=[self.nb_S*(self.N-self.n_h),self.n_h])
 #         self.H = np.empty(shape=[self.n_h,self.N-self.n_h])
 #         self.X = np.sin(self.X)
+        # Same way as in the paper #################################################
+#         self.H = np.empty(shape=[self.nb_S*self.n_h,self.N-self.n_h])
 #         for i in range(self.n_h):
 #             self.H[self.nb_S*i:self.nb_S*(i+1),:] = self.X[:,i:self.N - self.n_h + i]
+        # Adding the input #################################################
+        ns = self.nb_S + 4
+        self.H = np.empty(shape=[ns*self.n_h,self.N-self.n_h])
+        U = self.U[:,np.newaxis]
+        for i in range(self.n_h):
+#             self.H[ns*i:ns*(i+1),:] = np.concatenate((self.X[:,i:self.N - self.n_h + i],np.sin(self.X[:,i:self.N - self.n_h + i]),U[i:self.N - self.n_h + i,:].T),axis=0)
+            self.H[ns*i:ns*(i+1),:] = np.concatenate((self.X[:,i:self.N - self.n_h + i],np.square(self.X[:,i:self.N - self.n_h + i]),
+                                                     np.cos(self.X[:,i:self.N - self.n_h + i])),axis=0)
+        ####################################################################
+#         self.H = np.empty(shape=[self.n_h,self.nb_S*(self.N - self.n_h)])
 #         for i in range(self.n_h):
-#             self.H[:,i] = inline(self.X[:,i:self.N - self.n_h + i]).T
+#             self.H[i,0::2] = self.X[0,i:self.N - self.n_h + i]
+#             self.H[i,1::2] = self.X[1,i:self.N - self.n_h + i]
             
     def SVD(self, tau):
+        # Perform SVD ###########################################################
         self.tau = tau # Number of embedded delays desired
         self.u, self.s, self.vh = svd(self.H, full_matrices=False)
         self.sigma = self.s
         self.v = self.vh.T
-        # Restrict to desired subspace
+        # Restrict to desired subspace ##########################################
         self.u, self.s, self.v = self.u[:,:self.tau], self.s[:self.tau], self.v[:,:self.tau]
         self.Y = self.v.T
-        self.C = self.u[0:self.nb_S,:]@np.diag(self.s) # Mapping between subspace and original space
+        self.C = self.u[0:2,:]@np.diag(self.s) # Mapping between subspace and original space
         
     def LS(self, p, rcond=None):
         Y_cut = self.Y[:,:self.Y.shape[1]-1]
