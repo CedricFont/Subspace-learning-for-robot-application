@@ -318,7 +318,7 @@ class HAVOK:
         self.nb_S = X.shape[0] # Number of states
         self.nb_U = U.shape[0] # Number of control inputs
         
-    def HANKEL(self, horizon):
+    def HANKEL(self, horizon, delay_spacing=None):
         self.n_h = horizon # Number of points in one trajectory
 #         self.H = np.empty(shape=[self.n_h*self.nb_S,self.N-self.n_h])
         # My original way ##########################################################
@@ -335,17 +335,19 @@ class HAVOK:
 #         self.H = np.empty(shape=[self.n_h,self.N-self.n_h])
 #         self.X = np.sin(self.X)
         # Same way as in the paper #################################################
-#         self.H = np.empty(shape=[self.nb_S*self.n_h,self.N-self.n_h])
-#         for i in range(self.n_h):
-#             self.H[self.nb_S*i:self.nb_S*(i+1),:] = self.X[:,i:self.N - self.n_h + i]
-        # Adding the input #################################################
-        ns = self.nb_S + 4
-        self.H = np.empty(shape=[ns*self.n_h,self.N-self.n_h])
-        U = self.U[:,np.newaxis]
+        if delay_spacing is not None: s = delay_spacing
+        else: s = 0
+        self.H = np.empty(shape=[self.nb_S*self.n_h,self.N-self.n_h-self.n_h*s])
         for i in range(self.n_h):
+            self.H[self.nb_S*i:self.nb_S*(i+1),:] = self.X[:,i + s*i:self.N - self.n_h - self.n_h*s + i + s*i]
+        # Adding the input #################################################
+#         ns = self.nb_S + 4
+#         self.H = np.empty(shape=[ns*self.n_h,self.N-self.n_h])
+#         U = self.U[:,np.newaxis]
+#         for i in range(self.n_h):
 #             self.H[ns*i:ns*(i+1),:] = np.concatenate((self.X[:,i:self.N - self.n_h + i],np.sin(self.X[:,i:self.N - self.n_h + i]),U[i:self.N - self.n_h + i,:].T),axis=0)
-            self.H[ns*i:ns*(i+1),:] = np.concatenate((self.X[:,i:self.N - self.n_h + i],np.square(self.X[:,i:self.N - self.n_h + i]),
-                                                     np.cos(self.X[:,i:self.N - self.n_h + i])),axis=0)
+#             self.H[ns*i:ns*(i+1),:] = np.concatenate((self.X[:,i:self.N - self.n_h + i],np.square(self.X[:,i:self.N - self.n_h + i]),
+#                                                      np.cos(self.X[:,i:self.N - self.n_h + i])),axis=0)
         ####################################################################
 #         self.H = np.empty(shape=[self.n_h,self.nb_S*(self.N - self.n_h)])
 #         for i in range(self.n_h):
@@ -361,6 +363,7 @@ class HAVOK:
         # Restrict to desired subspace ##########################################
         self.u, self.s, self.v = self.u[:,:self.tau], self.s[:self.tau], self.v[:,:self.tau]
         self.Y = self.v.T
+        # Learn on differences ##################################################
         self.C = self.u[0:2,:]@np.diag(self.s) # Mapping between subspace and original space
         
     def LS(self, p, rcond=None):
@@ -388,6 +391,9 @@ class HAVOK:
         for i in range(self.N-1):
             self.Y_traj[:,i+1] = self.A@self.Y_traj[:,i] + self.B[:,0]*U[i]
         self.X_traj = self.C@self.Y_traj
+        
+    def TrajError(self,X):
+        self.traj_error = np.sqrt(np.sum(np.square(X - self.X_traj),axis=1))
         
     def LS_residuals(self, AB):
         self.residuals = np.sum(np.square(self.C@(AB@self.YU - self.Y[:,1:self.Y.shape[1]])),axis=1)
