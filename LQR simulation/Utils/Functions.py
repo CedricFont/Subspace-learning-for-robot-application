@@ -340,6 +340,10 @@ class HAVOK:
         self.H = np.empty(shape=[self.nb_S*self.n_h,self.N-self.n_h-self.n_h*s])
         for i in range(self.n_h):
             self.H[self.nb_S*i:self.nb_S*(i+1),:] = self.X[:,i + s*i:self.N - self.n_h - self.n_h*s + i + s*i]
+        # Extend the input ######################################################
+        self.Ue = np.empty(shape=[self.n_h,self.N-self.n_h-self.n_h*s])
+        for i in range(self.n_h):
+            self.Ue[i,:] = self.U[i + s*i:self.N - self.n_h - self.n_h*s + i + s*i]
         # Adding the input #################################################
 #         ns = self.nb_S + 4
 #         self.H = np.empty(shape=[ns*self.n_h,self.N-self.n_h])
@@ -363,12 +367,19 @@ class HAVOK:
         # Restrict to desired subspace ##########################################
         self.u, self.s, self.v = self.u[:,:self.tau], self.s[:self.tau], self.v[:,:self.tau]
         self.Y = self.v.T
+        # Construct projection matrix into U ####################################
+        self.ut = self.u.T
+        self.P= self.ut@inv(self.ut.T@self.ut)@self.ut.T
+        # Project extended input subspace #######################################
+        self.Ue = self.Ue[:self.tau,:]
+        self.Up = self.P@self.Ue
         # Learn on differences ##################################################
         self.C = self.u[0:2,:]@np.diag(self.s) # Mapping between subspace and original space
         
     def LS(self, p, rcond=None):
         Y_cut = self.Y[:,:self.Y.shape[1]-1]
-        self.YU = np.concatenate((Y_cut,self.U[:Y_cut.shape[1],np.newaxis].T), axis=0)
+#         self.YU = np.concatenate((Y_cut,self.U[:Y_cut.shape[1],np.newaxis].T), axis=0)
+        self.YU = np.concatenate((Y_cut,self.Ue[:,:Y_cut.shape[1]]), axis=0)
 #         u, s, vt = svd(self.YU)
 #         u, s, vt = u[:,:p], s[:p], vt[:p,:]
         Y = self.Y[:,1:self.Y.shape[1]]
