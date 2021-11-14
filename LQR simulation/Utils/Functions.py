@@ -340,11 +340,11 @@ class HAVOK:
         self.H = np.empty(shape=[self.nb_S*self.n_h,self.N-self.n_h-self.n_h*s])
         for i in range(self.n_h):
             self.H[self.nb_S*i:self.nb_S*(i+1),:] = self.X[:,i + s*i:self.N - self.n_h - self.n_h*s + i + s*i]
-        # Extend the input ######################################################
+        # Extend the input #########################################################
         self.Ue = np.empty(shape=[self.n_h,self.N-self.n_h-self.n_h*s])
         for i in range(self.n_h):
             self.Ue[i,:] = self.U[i + s*i:self.N - self.n_h - self.n_h*s + i + s*i]
-        # Adding the input #################################################
+        # Adding the input #########################################################
 #         ns = self.nb_S + 4
 #         self.H = np.empty(shape=[ns*self.n_h,self.N-self.n_h])
 #         U = self.U[:,np.newaxis]
@@ -352,7 +352,7 @@ class HAVOK:
 #             self.H[ns*i:ns*(i+1),:] = np.concatenate((self.X[:,i:self.N - self.n_h + i],np.sin(self.X[:,i:self.N - self.n_h + i]),U[i:self.N - self.n_h + i,:].T),axis=0)
 #             self.H[ns*i:ns*(i+1),:] = np.concatenate((self.X[:,i:self.N - self.n_h + i],np.square(self.X[:,i:self.N - self.n_h + i]),
 #                                                      np.cos(self.X[:,i:self.N - self.n_h + i])),axis=0)
-        ####################################################################
+        ############################################################################
 #         self.H = np.empty(shape=[self.n_h,self.nb_S*(self.N - self.n_h)])
 #         for i in range(self.n_h):
 #             self.H[i,0::2] = self.X[0,i:self.N - self.n_h + i]
