@@ -337,14 +337,20 @@ class HAVOK:
         # Same way as in the paper #################################################
         if delay_spacing is not None: s = delay_spacing
         else: s = 0
+        # Only putting the state ###################################################
         self.H = np.empty(shape=[self.nb_S*self.n_h,self.N-self.n_h-self.n_h*s])
         for i in range(self.n_h):
             self.H[self.nb_S*i:self.nb_S*(i+1),:] = self.X[:,i + s*i:self.N - self.n_h - self.n_h*s + i + s*i]
-        # Extend the input ######################################################
+        # Putting both states and input ############################################
+#         self.H = np.empty(shape=[(self.nb_S+1)*self.n_h,self.N-self.n_h-self.n_h*s])
+#         for i in range(self.n_h):
+#             self.H[self.nb_S*i:self.nb_S*(i+1),:] = self.X[:,i + s*i:self.N - self.n_h - self.n_h*s + i + s*i]
+#             self.H[self.nb_S*(i+1),:] = self.U[i + s*i:self.N - self.n_h - self.n_h*s + i + s*i]
+        # Extend the input #########################################################
         self.Ue = np.empty(shape=[self.n_h,self.N-self.n_h-self.n_h*s])
         for i in range(self.n_h):
             self.Ue[i,:] = self.U[i + s*i:self.N - self.n_h - self.n_h*s + i + s*i]
-        # Adding the input #################################################
+        # Adding the input #########################################################
 #         ns = self.nb_S + 4
 #         self.H = np.empty(shape=[ns*self.n_h,self.N-self.n_h])
 #         U = self.U[:,np.newaxis]
@@ -352,7 +358,7 @@ class HAVOK:
 #             self.H[ns*i:ns*(i+1),:] = np.concatenate((self.X[:,i:self.N - self.n_h + i],np.sin(self.X[:,i:self.N - self.n_h + i]),U[i:self.N - self.n_h + i,:].T),axis=0)
 #             self.H[ns*i:ns*(i+1),:] = np.concatenate((self.X[:,i:self.N - self.n_h + i],np.square(self.X[:,i:self.N - self.n_h + i]),
 #                                                      np.cos(self.X[:,i:self.N - self.n_h + i])),axis=0)
-        ####################################################################
+        ############################################################################
 #         self.H = np.empty(shape=[self.n_h,self.nb_S*(self.N - self.n_h)])
 #         for i in range(self.n_h):
 #             self.H[i,0::2] = self.X[0,i:self.N - self.n_h + i]
@@ -371,14 +377,25 @@ class HAVOK:
         self.ut = self.u.T
         self.P= self.ut@inv(self.ut.T@self.ut)@self.ut.T
         # Project extended input subspace #######################################
+#         u_u, s_u, v_uh = svd(self.Ue)
+#         u_u = u_u[:,:self.tau]
+#         s_u = s_u[:self.tau]
+#         self.Cu = u_u[0,:]@np.diag(s_u)
         self.Ue = self.Ue[:self.tau,:]
         self.Up = self.P@self.Ue
+#         self.Ue = v_uh.T[:,:self.tau].T
         # Learn on differences ##################################################
         self.C = self.u[0:2,:]@np.diag(self.s) # Mapping between subspace and original space
+        #########################################################################
+#         self.Cu = self.u[2,:]@np.diag(self.s)
+#         self.Cu = self.Cu[:,np.newaxis].T
+        
         
     def LS(self, p, rcond=None):
         Y_cut = self.Y[:,:self.Y.shape[1]-1]
 #         self.YU = np.concatenate((Y_cut,self.U[:Y_cut.shape[1],np.newaxis].T), axis=0)
+#         self.YU = np.concatenate((Y_cut,pinv(self.Cu)@self.U[:Y_cut.shape[1],np.newaxis].T), axis=0)
+#         self.Ue = self.u[0,:,np.newaxis]@self.U[:,np.newaxis].T
         self.YU = np.concatenate((Y_cut,self.Ue[:,:Y_cut.shape[1]]), axis=0)
 #         u, s, vt = svd(self.YU)
 #         u, s, vt = u[:,:p], s[:p], vt[:p,:]
@@ -393,6 +410,8 @@ class HAVOK:
     def Simulate(self, X0, U_testing=None):
         if U_testing is None: U = self.U
         else: U = U_testing
+#         U = (pinv(self.Cu)@U[:,np.newaxis].T).T
+#         U = (self.Cu.T@U[:,np.newaxis].T).T
         Y0 = pinv(self.C)@X0
         N = np.eye(self.tau) - pinv(self.C) @ self.C # Nullspace projection operator
         Y0 = Y0 + N @ (self.Y[:,0] - Y0) # Corresponding position in subspace
