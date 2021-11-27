@@ -1,5 +1,6 @@
 import numpy as np
 from numpy.linalg import inv, lstsq, pinv
+from numpy import linalg as lg
 from scipy import linalg as slg
 from scipy.linalg import svd
 import pbdlib as pbd
@@ -560,24 +561,112 @@ class SLFC:
         """
         Extended dynamics mode decomposition
         """
-        AB = self.X_lift_plus@slg.pinv(np.concatenate((self.X_lift,self.U[:self.X_lift.shape[1],np.newaxis].T),axis=0))
+        self.lift_dim = self.X_lift.shape[0]
+        XU = np.concatenate((self.X_lift,self.U[:self.X_lift.shape[1],np.newaxis].T),axis=0)
+        AB = self.X_lift_plus@slg.pinv(XU)
         self.A = AB[:,:AB.shape[1]-1]
         self.B = AB[:,AB.shape[1]-1]
-        self.C = self.X[:,:self.X_lift.shape[1]]@pinv(self.X_lift)
+        self.B = self.B[:,np.newaxis]
+#         self.C = self.X[:,:self.lift_dim]@pinv(self.X_lift)
+        self.C = np.zeros(shape=[self.nb_S,self.lift_dim])
+        self.C[:,:self.nb_S] = np.eye(self.nb_S)
+        
+        self.loss = np.sum(np.square((self.X_lift_plus - AB@XU).T@(self.X_lift_plus - AB@XU)))
         
     def Simulate(self, X, U):
-        self.lift_dim = self.X_lift.shape[0]
-        X0 = self.X[:,0]
+        N = X.shape[1]
+        X0 = X[:,0]
         Y0 = pinv(self.C)@X0
-        N = np.eye(self.lift_dim) - pinv(self.C) @ self.C # Nullspace projection operator
-        Y0 = Y0 + N @ (self.X_lift[:,0] - Y0) # Corresponding position in subspace
+#         N_ = np.eye(self.lift_dim) - pinv(self.C) @ self.C # Nullspace projection operator
+#         Y0 = Y0 + N_ @ (self.X_lift[:,0] - Y0) # Corresponding position in subspace
         #######################################
-        self.X_sim_lift = np.empty(shape=[self.lift_dim,self.N])
+        self.X_sim_lift = np.empty(shape=[self.lift_dim,N])
         self.X_sim_lift[:,0] = Y0
-        for i in range(self.N-1):
+        for i in range(N-1):
             self.X_sim_lift[:,i+1] = self.A@self.X_sim_lift[:,i] + self.B[:,np.newaxis].T*U[i]
         self.X_sim = self.C@self.X_sim_lift
               
+    def trajLoss(self, X, Xp):
+        """
+        Sum of square errors of the trajectory w.r.t. reference trajectory
+        """
+        self.traj_loss = np.sqrt(np.sum(np.square((X - Xp).T@(X - Xp))))
+        
+    def ConstructLQR(self, x_std, u_std, dt, ref, *args):
+        self.u_std, self.x_std = u_std, x_std
+        if len(args) == 2:
+            reference = args[0]
+            custom_precision = args[1]
+            N = reference.shape[1]
+        else:
+            N = self.N
+            reference = np.zeros([N,self.nb_S])
+            reference[:,0] = ref 
+            
+        # Build LQR problem instance
+        self.LQR = pbd.LQR(self.A, self.B, nb_dim=self.lift_dim, dt=dt, horizon=len(ref))
+
+        self.LQR.z = (pinv(self.C)@reference.T).T
+
+        # Trajectory timing (1 via-point = 1 time-step, should be as long as the horizon)
+        seq_tracking = 1*[0]
+
+        for i in range(1,N):
+            seq_tracking += (1)*[i]
+
+        self.LQR.seq_xi = seq_tracking
+
+        # Control precision 
+        self.LQR.gmm_u = u_std
+
+        # Tracking precision
+        x_std = 1e6 # Importance of tracking the position
+        Q_tracking = np.empty(shape=[N,self.lift_dim,self.lift_dim])
+
+        for i in range(N):
+            if len(args) == 2:
+                cost = custom_precision[:,i]
+            else:
+                cost = np.array([x_std,0])
+            Q_tracking[i,:,:] = self.C.T@np.diag(cost)@self.C # Put zero velocity precision
+
+        self.LQR.Q = Q_tracking
+        self.LQR.ricatti()
+        self.K_lift = self.LQR.K
+        self.K = self.K_lift@pinv(self.C)
+        
+    def LQR_simulate(self, X0):
+        N = np.eye(self.lift_dim) - pinv(self.C)@self.C # Nullspace projection operator
+        X0_lift = np.zeros((1,self.lift_dim))
+        X0_lift[0,:] = pinv(self.C)@X0 + N@(self.X_lift[:,0] - pinv(self.C)@X0)
+        ys, self.LQR_U = self.LQR.make_rollout(X0_lift)
+        ys_mean = np.mean(ys, axis=0)
+        xs = self.C@ys_mean.T # Map back to original space
+        xs = xs.T
+        self.LQR_X = xs
+
+    def LQR_cost(self, X, U, ref, *args):
+        if len(args) == 1:
+            N = args[0]
+        else:
+            N = self.N
+
+        Qu = np.diag(np.ones(N-1)*self.u_std)
+        Q_tracking_modified = self.LQR.Q[:,0:self.nb_S-1,0:self.nb_S-1]
+
+        cost_X = 0
+        for i in range(N):
+            cost_X += (X[0,i] - ref[i]).T*Q_tracking_modified[i,0,0]*(X[0,i] - ref[i])
+
+        self.J = U.T@Qu@U + cost_X
+        self.xQx, self.uRu = cost_X, U.T@Qu@U
+        return self.J
+    
+    def RMSE(self, X_pred, X_true):
+        delta_X_norm = lg.norm(X_true - X_pred, ord=2, axis=0)
+        X_true_norm = lg.norm(X_true, ord=2, axis=0)
+        return 100*delta_X_norm.sum()/X_true_norm.sum()
+            
 class LQR_Transform:
     """
     Facilitates the transformation of a delay-embedded system into a LQR
