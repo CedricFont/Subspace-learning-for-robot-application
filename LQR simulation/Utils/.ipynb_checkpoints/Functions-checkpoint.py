@@ -310,75 +310,35 @@ class DelayedLeastSquare:
         
 class HAVOK:
     """
-    Defines all necessary methods to identify a system using input and state measurement data
+    Hankel Alternative View Of Koopman
+    Step 1 : learn SVD time-embedded coordinate system
+    Step 2 : learn linear DMD model of the dynamics within this coordinate system
+    Step 3 : plan LQR gains for controlling original non-linear system in a linear fashion
     """
-    def __init__(self, X, U):
+    def __init__(self, X, U, **kwargs):
         self.X = X
         self.U = U
         self.N = X.shape[1] # Total number of points
+        if len(kwargs) == 1: self.N += 1
         self.nb_S = X.shape[0] # Number of states
-        self.nb_U = U.shape[0] # Number of control inputs
+        self.nb_U = 1 # Number of control inputs
+        
         
     def HANKEL(self, horizon, delay_spacing=None):
         self.n_h = horizon # Number of points in one trajectory
         self.spacing = delay_spacing
         if delay_spacing is not None: s = delay_spacing
         else: s = 1
-        # Augmenting the state ####################################################
-#         self.H = np.empty(shape=[(self.nb_S + 1)*self.n_h,self.N-self.n_h*s]) # Include input
-#         for i in range(self.n_h):
-#             self.H[(self.nb_S+1)*i:(self.nb_S+1)*(i+1),:] = np.concatenate((self.X[:,s*i:self.N - self.n_h*s + s*i],
-#                                                                             self.U[:,s*i:self.N - self.n_h*s + s*i]), axis=0) # Delaying states and input
-        # My original way ##########################################################
-#         for i in range(self.N-self.n_h):
-#             self.H[:,i] = inline(self.X[:,i:i+self.n_h]).T
-#             self.H[0::2,i] = self.X[0,i:i+self.n_h].T
-#             self.H[1::2,i] = self.X[1,i:i+self.n_h].T
-        # Using only 1 state for learning ##########################################
-#         self.H = np.empty(shape=[self.n_h,self.N-self.n_h])
-#         for i in range(self.N-self.n_h):
-#             self.H[:,i] = self.X[0,i:i+self.n_h].T
-        
-#         self.H = np.empty(shape=[self.nb_S*(self.N-self.n_h),self.n_h])
-#         self.H = np.empty(shape=[self.n_h,self.N-self.n_h])
-#         self.X = np.sin(self.X)
-        # Same way as in the paper #################################################
-#         # Only putting the state ###################################################
+        #########################################################################
         self.H = np.empty(shape=[self.nb_S*self.n_h,self.N-self.n_h*s])
         for i in range(self.n_h):
             self.H[self.nb_S*i:self.nb_S*(i+1),:] = self.X[:,s*i:self.N - self.n_h*s + s*i]
-        # Extend the input #########################################################
-        self.Ue = np.empty(shape=[self.n_h,self.N-self.n_h*s])
-        for i in range(self.n_h):
-            self.Ue[i,:] = self.U[s*i:self.N - self.n_h*s + s*i]
-        
-        # Only putting the state ###################################################
-#         n_col = (self.N - self.n_h)//s+1
-#         self.H = np.empty(shape=[self.nb_S*self.n_h,n_col])
+        self.Un = np.empty(shape=[self.nb_U*self.n_h,self.N-self.n_h*s])
 #         for i in range(self.n_h):
-#             self.H[self.nb_S*i:self.nb_S*(i+1),:] = self.X[:,i:self.N - self.n_h  + i:s]
-#         # Extend the input #########################################################
-#         self.Ue = np.empty(shape=[self.n_h,n_col])
+#             self.Un[self.nb_S*i,:] = np.zeros(shape=[1,self.N-self.n_h*s])
+#             self.Un[self.nb_S*i + 1,:] = self.U[s*i:self.N - self.n_h*s + s*i]
 #         for i in range(self.n_h):
-#             self.Ue[i,:] = self.U[i:self.N - self.n_h + i:s]
-        # Putting both states and input ############################################
-#         self.H = np.empty(shape=[(self.nb_S+1)*self.n_h,self.N-self.n_h*s])
-#         for i in range(self.n_h):
-#             self.H[self.nb_S*i:self.nb_S*(i+1),:] = self.X[:,s*i:self.N - self.n_h*s + s*i]
-#             self.H[self.nb_S*(i+1),:] = self.U[s*i:self.N - self.n_h*s + s*i]
-        # Adding the input #########################################################
-#         ns = self.nb_S + 4
-#         self.H = np.empty(shape=[ns*self.n_h,self.N-self.n_h])
-#         U = self.U[:,np.newaxis]
-#         for i in range(self.n_h):
-#             self.H[ns*i:ns*(i+1),:] = np.concatenate((self.X[:,i:self.N - self.n_h + i],np.sin(self.X[:,i:self.N - self.n_h + i]),U[i:self.N - self.n_h + i,:].T),axis=0)
-#             self.H[ns*i:ns*(i+1),:] = np.concatenate((self.X[:,i:self.N - self.n_h + i],np.square(self.X[:,i:self.N - self.n_h + i]),
-#                                                      np.cos(self.X[:,i:self.N - self.n_h + i])),axis=0)
-        ############################################################################
-#         self.H = np.empty(shape=[self.n_h,self.nb_S*(self.N - self.n_h)])
-#         for i in range(self.n_h):
-#             self.H[i,0::2] = self.X[0,i:self.N - self.n_h + i]
-#             self.H[i,1::2] = self.X[1,i:self.N - self.n_h + i]
+#             self.Un[self.nb_U*i,:] = self.U[s*i:self.N - self.n_h*s + s*i]
             
     def SVD(self, tau):
         # Perform SVD ###########################################################
@@ -389,75 +349,43 @@ class HAVOK:
         # Restrict to desired subspace ##########################################
         self.u, self.s, self.v = self.u[:,:self.tau], self.s[:self.tau], self.v[:,:self.tau]
         self.Y = self.v.T
-        self.C = self.u[0:2,:]@np.diag(self.s) # Mapping between subspace and original space
-#         self.Cu = self.u[2,:]@np.diag(self.s) # Mapping between subspace and input
+        self.C = self.u[0:2,:]@np.diag(self.s) 
+        # Project u from R^n to R^r using SVD modes projection matrix ###########
+#         self.S = self.u@np.diag(self.s) # Projection matrix from R^r to R^n
+#         self.P = inv(self.S.T@self.S)@self.S.T
+#         self.Ur = self.P@self.Un # Input matrix evolving within subspace
+#         self.Cu = self.U[:self.N - self.n_h*self.spacing]@self.Ur.T@inv(self.Ur@self.Ur.T)
 #         self.Cu = self.Cu[:,np.newaxis].T
-        # Construct projection matrix into U ####################################
-#         self.ut = self.u.T
-#         self.P= self.ut@inv(self.ut.T@self.ut)@self.ut.T
-#         self.Ue = self.Ue[:self.tau,:]
-#         self.Up = self.P@self.Ue
-        #########################################################################
-#         self.ut = self.u.T
-#         self.P= self.ut@inv(self.ut.T@self.ut)@self.ut.T
-#         self.Ur = np.empty(shape=[self.tau,self.N - self.n_h*self.spacing])
-#         for i in range(self.tau):
-#             self.Ur[i,:] = self.U[self.spacing*i:self.N - self.n_h*self.spacing + self.spacing*i]
-#         self.U_proj = self.P@self.Ur
-#         self.Cu = self.U[0:self.N - self.n_h*self.spacing]@pinv(self.U_proj)
-#         self.Cu = self.Cu[:,np.newaxis].T
-        #########################################################################
-#         self.Cu1 = self.Cu[:,np.newaxis].T
-#         unit_vector = np.zeros([1,self.tau])
-#         unit_vector[0,0] = 1
-#         self.Cu = unit_vector@inv(self.P)
-#         u_in, s_in, v_in = svd(self.Ue)
-#         self.Cu = u_in[0,:self.tau]@np.diag(s_in[:self.tau])
-#         self.Cu = self.Cu[:,np.newaxis].T
-        # Project extended input subspace #######################################
-#         u_u, s_u, v_uh = svd(self.Ue)
-#         u_u = u_u[:,:self.tau]
-#         s_u = s_u[:self.tau]
-#         self.Cu = u_u[0,:]@np.diag(s_u)
-        
-#         self.Ue = v_uh.T[:,:self.tau].T
-        
-        #########################################################################
-#         self.Cu = self.u[2,:]@np.diag(self.s)
-#         self.Cu = self.Cu[:,np.newaxis].T
-        
         
     def LS(self, p, rcond=None):
         Y_cut = self.Y[:,:self.Y.shape[1]-1]
         self.YU = np.concatenate((Y_cut,self.U[:Y_cut.shape[1],np.newaxis].T), axis=0)
-#         self.YU = np.concatenate((Y_cut,pinv(self.Cu)@self.U[:Y_cut.shape[1],np.newaxis].T), axis=0)
-#         self.Ue = self.u[0,:,np.newaxis]@self.U[:,np.newaxis].T
-#         self.YU = np.concatenate((Y_cut,self.U_proj[:,:Y_cut.shape[1]]), axis=0)
-#         self.YU = np.concatenate((Y_cut,pinv(self.Cu)@self.U[:,:Y_cut.shape[1]]), axis=0) # Mapping the input
-#         u, s, vt = svd(self.YU)
-#         u, s, vt = u[:,:p], s[:p], vt[:p,:]
+#         self.YU = np.concatenate((Y_cut,self.Ur[:,:Y_cut.shape[1]]), axis=0)
+#         U2 = np.concatenate((np.zeros(shape=[1,Y_cut.shape[1]]),self.U[:Y_cut.shape[1],np.newaxis].T),axis=0)
+#         self.YU = np.concatenate((Y_cut,slg.pinv2(self.C)@U2), axis=0)
         Y = self.Y[:,1:self.Y.shape[1]]
         AB, self.res, _, _ = lstsq(self.YU.T,Y.T,rcond)
         AB = AB.T
         self.LS_residuals(AB)
         self.A, self.B = AB[:,:self.tau], AB[:,self.tau:AB.shape[1]]
         
-    def Simulate(self, X0, U_testing=None, custom_N = None):
+    def Simulate(self, X0, U_testing=None):
         if U_testing is None: U = self.U
         else: U = U_testing
-        if custom_N is None: new_N = self.N
-        else: new_N = custom_N
-#         U = pinv(self.Cu)@(U[:,np.newaxis].T)
-#         U = (pinv(self.Cu)@U[:,np.newaxis].T).T
-#         U = (self.Cu.T@U[:,np.newaxis].T).T
         Y0 = pinv(self.C)@X0
         N = np.eye(self.tau) - pinv(self.C) @ self.C # Nullspace projection operator
         Y0 = Y0 + N @ (self.Y[:,0] - Y0) # Corresponding position in subspace
+#         Y0 = self.Y[:,0]
+        
+#         U = slg.pinv2(self.Cu)@U[:,np.newaxis].T
+#         U2 = np.concatenate((np.zeros(shape=[1,len(U)]),U[:,np.newaxis].T),axis=0)
+#         U = slg.pinv2(self.C)@U2
 
-        self.Y_traj = np.empty(shape=[self.tau,new_N])
+        self.Y_traj = np.empty(shape=[self.tau,self.N])
         self.Y_traj[:,0] = Y0
-        for i in range(new_N-1):
+        for i in range(self.N-1):
             self.Y_traj[:,i+1] = self.A@self.Y_traj[:,i] + self.B[:,np.newaxis].T*U[i]
+#             self.Y_traj[:,i+1] = self.A@self.Y_traj[:,i] + self.B@U[:,i]
         self.X_traj = self.C@self.Y_traj
         
     def TrajError(self,X):
@@ -466,22 +394,28 @@ class HAVOK:
     def LS_residuals(self, AB):
         self.residuals = (AB@self.YU - self.Y[:,1:self.Y.shape[1]])@(AB@self.YU - self.Y[:,1:self.Y.shape[1]]).T
         
-    def ConstructLQR(self, x_std, u_std, dt, ref, horizon=None, custom_trajectory=None):
+    def ConstructLQR(self, x_std, u_std, dt, ref, **kwargs):
         self.u_std, self.x_std = u_std, x_std
-        if horizon is not None: N = horizon
-        else: N = self.N
         
-        # Build LQR problem instance
-        self.LQR = pbd.LQR(self.A, self.B, nb_dim=self.tau, dt=dt, horizon=N)
-
-        # Reference tracking
-        if custom_trajectory is not None:
+        if len(kwargs) == 1: # Via-points
             reference = ref
+            precision = kwargs["precision"]
+            N = ref.shape[0]
         else:
+            N = self.N
             reference = np.zeros([N,self.nb_S])
             reference[:,0] = ref 
+            
+#         A_tilda = np.eye(self.A.shape[0]+1)
+#         A_tilda[:self.A.shape[0],:self.A.shape[0]] = self.A
+#         self.B_tilda = np.concatenate((self.B,np.zeros([1,1])),axis=0)
+            
+        # Build LQR problem instance
+        self.LQR = pbd.LQR(self.A, self.B, nb_dim=self.tau, dt=dt, horizon=len(ref))
+#         self.LQR = pbd.LQR(A_tilda, self.B_tilda, nb_dim=self.tau+1, dt=dt, horizon=len(ref))
 
         self.LQR.z = (pinv(self.C)@reference.T).T
+#         self.LQR.z = np.zeros([N,self.tau + 1])
 
         # Trajectory timing (1 via-point = 1 time-step, should be as long as the horizon)
         seq_tracking = 1*[0]
@@ -495,16 +429,22 @@ class HAVOK:
         self.LQR.gmm_u = u_std
 
         # Tracking precision
-        x_std = 1e6 # Importance of tracking the position
         Q_tracking = np.empty(shape=[N,self.tau,self.tau])
+#         self.Q_tracking = np.empty(shape=[N,self.tau + 1,self.tau + 1])
+#         self.C_tilda = np.concatenate((np.concatenate((self.C,np.zeros(shape=[1,self.C.shape[1]])),axis=0),
+#                                        np.concatenate((np.zeros(shape=[self.C.shape[0],1]),np.ones([1,1])),axis=0)),axis=1)
 
         for i in range(N):
-            if custom_trajectory is not None:
-                cost = custom_trajectory[:,i]
+            if len(kwargs) == 1:
+                cost = precision[:,i]
             else:
-                cost = np.array([x_std,0])
+                cost = np.array([x_std,1e-6])
             Q_tracking[i,:,:] = self.C.T@np.diag(cost)@self.C # Put zero velocity precision
-
+#             current_ref = reference[i,:,np.newaxis]
+#             ref_ref_T = current_ref@current_ref.T
+#             cost_matrix = np.concatenate((np.concatenate((inv(np.diag(cost)) + ref_ref_T,current_ref),axis=1),
+#                                                np.concatenate((current_ref.T,np.ones([1,1])),axis=1)),axis=0)
+#             self.Q_tracking[i,:,:] = self.C_tilda.T@cost_matrix@self.C_tilda # Put zero velocity precision
         self.LQR.Q = Q_tracking
         self.LQR.ricatti()
         
@@ -512,11 +452,21 @@ class HAVOK:
         N = np.eye(self.tau) - pinv(self.C)@self.C # Nullspace projection operator
         Y0 = np.zeros((1,self.tau))
         Y0[0,:] = pinv(self.C)@X0 + N@(self.Y[:,0] - pinv(self.C)@X0)
+        
+#         X0 = np.concatenate((X0,np.ones([1])))
+#         N = np.eye(self.tau + 1) - pinv(self.C_tilda)@self.C_tilda # Nullspace projection operator
+#         Y0 = np.zeros((1,self.tau + 1))
+#         Y0[0,:] = pinv(self.C_tilda)@X0 + N@(np.concatenate((self.Y[:,0],np.ones([1]))) - pinv(self.C_tilda)@X0)
+
+#         Y0[0,:] = np.concatenate((self.Y[:,0],np.ones([1])))
+        
         ys, self.LQR_U = self.LQR.make_rollout(Y0)
+        
         ys_mean = np.mean(ys, axis=0)
         xs = self.C@ys_mean.T # Map back to original space
         xs = xs.T
         self.LQR_X = xs
+        
         
     def LQR_cost(self, X, U, ref, horizon=None):
         if horizon is not None: N = horizon
@@ -533,6 +483,12 @@ class HAVOK:
         self.xQx, self.uRu = cost_X, U.T@Qu@U
         return self.J
     
+    def RMSE(self, X_pred, X_true, **kwargs):
+        delta_X_norm = lg.norm(X_true - X_pred, ord=2, axis=0)
+        X_true_norm = lg.norm(X_true, ord=2, axis=0)
+        if len(kwargs) == 1: X_true_norm = np.ones(1)
+        return 100*delta_X_norm.sum()/X_true_norm.sum()
+    
 class SLFC:
     """
     Subspace learning for control
@@ -545,13 +501,24 @@ class SLFC:
         self.nb_U = 1 # Number of control inputs
         
     def delayEmbeddings(self, nx, nu, d=1):
-        self.X_lift = np.empty(shape=[self.nb_S*nx + self.nb_U*nu,
+        self.X_lift = np.empty(shape=[self.nb_S*nx + self.nb_U*nu - 1 + 1,
                                       self.N - max(nx,nu)*d])
+#         for i in range(nx):
+#             self.X_lift[self.nb_S*i:self.nb_S*(i+1),:] = self.X[:,
+#                                                                d*i:self.N - max(nx,nu)*d + d*i]
+#         for i in range(nu):
+#             self.X_lift[nx*self.nb_S + i,:] = self.U[d*i:self.N - max(nx,nu)*d + d*i]
+
         for i in range(nx):
             self.X_lift[self.nb_S*i:self.nb_S*(i+1),:] = self.X[:,
                                                                d*i:self.N - max(nx,nu)*d + d*i]
-        for i in range(nu):
+        for i in range(1,nu):
             self.X_lift[nx*self.nb_S + i,:] = self.U[d*i:self.N - max(nx,nu)*d + d*i]
+            
+        self.X_lift[nx*self.nb_S + nu*self.nb_U - 1,:] = slg.norm(np.concatenate((self.X[:,:self.N - max(nx,nu)*d],
+                                                  self.U[:self.N - max(nx,nu)*d,np.newaxis].T),axis=0))
+        
+#         self.X_lift[nx*self.nb_S + nu*self.nb_U ,:] = np.ones(shape=[1,self.N - max(nx,nu)*d])
             
         # Defining the inputs of the regression problem
         self.X_lift_plus = self.X_lift[:,1:]
@@ -563,11 +530,10 @@ class SLFC:
         """
         self.lift_dim = self.X_lift.shape[0]
         XU = np.concatenate((self.X_lift,self.U[:self.X_lift.shape[1],np.newaxis].T),axis=0)
-        AB = self.X_lift_plus@slg.pinv(XU)
+        AB = self.X_lift_plus@slg.pinv2(XU)
         self.A = AB[:,:AB.shape[1]-1]
         self.B = AB[:,AB.shape[1]-1]
         self.B = self.B[:,np.newaxis]
-#         self.C = self.X[:,:self.lift_dim]@pinv(self.X_lift)
         self.C = np.zeros(shape=[self.nb_S,self.lift_dim])
         self.C[:,:self.nb_S] = np.eye(self.nb_S)
         
