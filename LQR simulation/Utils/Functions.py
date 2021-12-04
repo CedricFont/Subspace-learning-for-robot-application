@@ -333,7 +333,7 @@ class HAVOK:
         self.H = np.empty(shape=[self.nb_S*self.n_h,self.N-self.n_h*s])
         for i in range(self.n_h):
             self.H[self.nb_S*i:self.nb_S*(i+1),:] = self.X[:,s*i:self.N - self.n_h*s + s*i]
-        self.Un = np.empty(shape=[self.nb_U*self.n_h,self.N-self.n_h*s])
+#         self.Un = np.empty(shape=[self.nb_U*self.n_h,self.N-self.n_h*s])
 #         for i in range(self.n_h):
 #             self.Un[self.nb_S*i,:] = np.zeros(shape=[1,self.N-self.n_h*s])
 #             self.Un[self.nb_S*i + 1,:] = self.U[s*i:self.N - self.n_h*s + s*i]
