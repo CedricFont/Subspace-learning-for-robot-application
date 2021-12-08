@@ -1,3 +1,6 @@
 [submodule "pandapybullet"]
 	path = pandapybullet
 	url = git@gitlab.idiap.ch:rli/pandapybullet.git
+[submodule "pbdlib-python"]
+	path = pbdlib-python
+	url = git@gitlab.idiap.ch:rli/pbdlib-python.git

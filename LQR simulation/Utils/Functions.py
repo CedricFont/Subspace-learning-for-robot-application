@@ -1,9 +1,11 @@
 import numpy as np
 from numpy.linalg import inv, lstsq, pinv
-from numpy import linalg as lg
+from numpy import linalg as lg, random as rnd
 from scipy import linalg as slg
 from scipy.linalg import svd
 import pbdlib as pbd
+from pbdlib import LQR
+from pbdlib.utils import get_canonical
 import matplotlib.pyplot as plt
 
 def RK4(func, X0, u, t, type=None):
@@ -223,6 +225,104 @@ class SimplePendulum:
         output[0:2] = np.array((dx1dt,dx2dt))
         return output
     
+class Robot:
+    """
+    - Creates random trajectories for each joints while taking joint limits into account
+    - Converts robot dynamics data into state-space form
+    """
+    def __init__(self, n_joints, nu, dt, N, robot):
+        self.nb_joints = n_joints
+        self.nb_S = n_joints*2
+        self.nb_U = nu
+        self.N = N
+        self.dt = dt
+        self.T = np.arange(0,N*dt,dt)
+        self.time = np.arange(0,N)
+        self.robot = robot # PyBullet instance
+        
+    def isCollisionHappened(self, traj, margin):
+        table_height = .9 + .9*margin # To take bad control into account
+        
+        for i in range(traj.shape[1]):
+            self.robot.default_q = traj[:,i]
+            self.robot.reset_q()
+            end_effector_pos = self.robot.x[2]
+            
+            if end_effector_pos < table_height: return True
+        
+        return False
+        
+    def drawTrajectories(self, nb_traj, q_limits, specs):
+        self.nb_traj = nb_traj
+        phi_low = specs['phi']['low']
+        phi_high = specs['phi']['high']
+        A_low = specs['A']['low']
+        A_high = specs['A']['high']
+        f_low = specs['f']['low']
+        f_high = specs['f']['high']
+        nb_parts = specs['nb_parts']
+        margin, safety = specs['margin'], specs['safety']
+        q_min, q_max = q_limits[:,0], q_limits[:,1]
+        
+        # LQR initialisation (double-integrator)
+        A,B = get_canonical(7,nb_deriv=2,dt=self.dt)
+        lqr = LQR(A, B, dt=self.dt, horizon=self.N)
+        lqr.gmm_u = -6.
+        temp = np.zeros(self.nb_S) 
+        temp[0:self.nb_S//2] = 1e3 # Only precision on position
+        lqr.Q = np.diag(temp)
+        
+        self.ref = np.zeros(shape=[nb_traj,self.nb_S,self.N])
+        self.desired_ddq = np.zeros(shape=[nb_traj,self.nb_S//2,self.N-1])
+        for j in range(self.nb_traj):
+            x_train = 0
+            collision_happened = True
+                
+#             while(collision_happened):
+                
+            for i in range(0, self.nb_S//2):
+
+                # Draw random sinusoid according to specifications
+                phi = rnd.uniform(low=phi_low, high=phi_high, size=nb_parts)
+                f = rnd.uniform(low=f_low, high=f_high, size=nb_parts)*self.dt
+                A = rnd.uniform(low=A_low, high=A_high, size=nb_parts)
+
+                # Construct reference within joints bounds
+                for nb in range(nb_parts):
+                    x_train = x_train + A[nb]*np.sin(2*np.pi*f[nb]*self.time + phi[nb])
+
+                if q_max[i] == -q_min[i]:
+                    x_train = safety*x_train/max(x_train)*q_max[i]
+                elif q_max[i] > abs(q_min[i]):
+                    x_train += -(min(x_train) - safety*q_min[i]) # Shift upwards
+                    if max(x_train) >= q_max[i]:
+                        x_train = safety*x_train/max(x_train)*q_max[i]
+                else: 
+                    x_train -= max(x_train) - safety*q_max[i] # Shift downwards
+                    if min(x_train) <= q_min[i]:
+                        x_train = safety*x_train/abs(min(x_train))*abs(q_min[i])
+
+                self.ref[j,i,:] = x_train  
+                        
+#                 collision_happened = self.isCollisionHappened(self.ref[j,:7,:], margin)
+                    
+            # Perform LQR of double integrator
+            z = self.ref[j,:,:].T
+            lqr.z = z
+            lqr.ricatti()
+            xs, us = lqr.get_seq(z[0,:])
+            self.desired_ddq[j,:,:] = us.T
+        
+    def toStateSpace(self, q, dq, u):
+        self.X = np.empty(shape=[self.nb_traj,self.nb_S,self.N])
+        
+        self.X[:,0:np.int(self.nb_S/2),:] = q
+        self.X[:,np.int(self.nb_S/2):,:] = dq
+        self.U = u
+        
+        self.dX = np.diff(self.X)
+        self.dU = np.diff(self.U)
+    
 class DelayedLeastSquare:
     """
     Defines a delay embedded version of a least square problem
@@ -321,8 +421,8 @@ class HAVOK:
         self.N = X.shape[1] # Total number of points
         if len(kwargs) == 1: self.N += 1
         self.nb_S = X.shape[0] # Number of states
-        self.nb_U = 1 # Number of control inputs
-        
+        if len(self.U.shape) == 1: self.nb_U = 1
+        else: self.nb_U = self.U.shape[0] # Number of control inputs
         
     def HANKEL(self, horizon, delay_spacing=None):
         self.n_h = horizon # Number of points in one trajectory
@@ -349,7 +449,8 @@ class HAVOK:
         # Restrict to desired subspace ##########################################
         self.u, self.s, self.v = self.u[:,:self.tau], self.s[:self.tau], self.v[:,:self.tau]
         self.Y = self.v.T
-        self.C = self.u[0:2,:]@np.diag(self.s) 
+        self.C = self.u[0:self.nb_S,:]@np.diag(self.s) 
+        self.pinvC = slg.pinv2(self.C)
         # Project u from R^n to R^r using SVD modes projection matrix ###########
 #         self.S = self.u@np.diag(self.s) # Projection matrix from R^r to R^n
 #         self.P = inv(self.S.T@self.S)@self.S.T
@@ -359,7 +460,10 @@ class HAVOK:
         
     def LS(self, p, rcond=None):
         Y_cut = self.Y[:,:self.Y.shape[1]-1]
-        self.YU = np.concatenate((Y_cut,self.U[:Y_cut.shape[1],np.newaxis].T), axis=0)
+        if self.nb_U == 1:
+            self.YU = np.concatenate((Y_cut,self.U[:Y_cut.shape[1],np.newaxis].T), axis=0)
+        else:
+            self.YU = np.concatenate((Y_cut,self.U[:,:Y_cut.shape[1]]), axis=0)
 #         self.YU = np.concatenate((Y_cut,self.Ur[:,:Y_cut.shape[1]]), axis=0)
 #         U2 = np.concatenate((np.zeros(shape=[1,Y_cut.shape[1]]),self.U[:Y_cut.shape[1],np.newaxis].T),axis=0)
 #         self.YU = np.concatenate((Y_cut,slg.pinv2(self.C)@U2), axis=0)
@@ -372,20 +476,17 @@ class HAVOK:
     def Simulate(self, X0, U_testing=None):
         if U_testing is None: U = self.U
         else: U = U_testing
-        Y0 = pinv(self.C)@X0
-        N = np.eye(self.tau) - pinv(self.C) @ self.C # Nullspace projection operator
+        Y0 = self.pinvC@X0
+        N = np.eye(self.tau) - self.pinvC @ self.C # Nullspace projection operator
         Y0 = Y0 + N @ (self.Y[:,0] - Y0) # Corresponding position in subspace
-#         Y0 = self.Y[:,0]
-        
-#         U = slg.pinv2(self.Cu)@U[:,np.newaxis].T
-#         U2 = np.concatenate((np.zeros(shape=[1,len(U)]),U[:,np.newaxis].T),axis=0)
-#         U = slg.pinv2(self.C)@U2
 
         self.Y_traj = np.empty(shape=[self.tau,self.N])
         self.Y_traj[:,0] = Y0
         for i in range(self.N-1):
-            self.Y_traj[:,i+1] = self.A@self.Y_traj[:,i] + self.B[:,np.newaxis].T*U[i]
-#             self.Y_traj[:,i+1] = self.A@self.Y_traj[:,i] + self.B@U[:,i]
+            if self.nb_U == 1:
+                self.Y_traj[:,i+1] = self.A@self.Y_traj[:,i] + self.B[:,np.newaxis].T*U[i]
+            else:
+                self.Y_traj[:,i+1] = self.A@self.Y_traj[:,i] + self.B@U[:,i]
         self.X_traj = self.C@self.Y_traj
         
     def TrajError(self,X):
@@ -404,17 +505,20 @@ class HAVOK:
         else:
             N = self.N
             reference = np.zeros([N,self.nb_S])
-            reference[:,0] = ref 
+            if len(ref.shape) == 1:
+                reference[:,0] = ref 
+            else:
+                reference = ref
             
 #         A_tilda = np.eye(self.A.shape[0]+1)
 #         A_tilda[:self.A.shape[0],:self.A.shape[0]] = self.A
 #         self.B_tilda = np.concatenate((self.B,np.zeros([1,1])),axis=0)
             
         # Build LQR problem instance
-        self.LQR = pbd.LQR(self.A, self.B, nb_dim=self.tau, dt=dt, horizon=len(ref))
+        self.LQR = pbd.LQR(self.A, self.B, nb_dim=self.tau, dt=dt, horizon=N)
 #         self.LQR = pbd.LQR(A_tilda, self.B_tilda, nb_dim=self.tau+1, dt=dt, horizon=len(ref))
 
-        self.LQR.z = (pinv(self.C)@reference.T).T
+        self.LQR.z = (self.pinvC@reference).T
 #         self.LQR.z = np.zeros([N,self.tau + 1])
 
         # Trajectory timing (1 via-point = 1 time-step, should be as long as the horizon)
@@ -438,7 +542,7 @@ class HAVOK:
             if len(kwargs) == 1:
                 cost = precision[:,i]
             else:
-                cost = np.array([x_std,1e-6])
+                cost = x_std
             Q_tracking[i,:,:] = self.C.T@np.diag(cost)@self.C # Put zero velocity precision
 #             current_ref = reference[i,:,np.newaxis]
 #             ref_ref_T = current_ref@current_ref.T
@@ -449,9 +553,9 @@ class HAVOK:
         self.LQR.ricatti()
         
     def LQR_simulate(self, X0):
-        N = np.eye(self.tau) - pinv(self.C)@self.C # Nullspace projection operator
+        N = np.eye(self.tau) - self.pinvC@self.C # Nullspace projection operator
         Y0 = np.zeros((1,self.tau))
-        Y0[0,:] = pinv(self.C)@X0 + N@(self.Y[:,0] - pinv(self.C)@X0)
+        Y0[0,:] = self.pinvC@X0 + N@(self.Y[:,0] - self.pinvC@X0)
         
 #         X0 = np.concatenate((X0,np.ones([1])))
 #         N = np.eye(self.tau + 1) - pinv(self.C_tilda)@self.C_tilda # Nullspace projection operator
@@ -461,10 +565,7 @@ class HAVOK:
 #         Y0[0,:] = np.concatenate((self.Y[:,0],np.ones([1])))
         
         ys, self.LQR_U = self.LQR.make_rollout(Y0)
-        
-        ys_mean = np.mean(ys, axis=0)
-        xs = self.C@ys_mean.T # Map back to original space
-        xs = xs.T
+        xs = self.C@ys[0,:,:].T # Map back to original space
         self.LQR_X = xs
         
         
