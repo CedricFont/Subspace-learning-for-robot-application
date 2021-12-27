@@ -7,6 +7,7 @@ import pbdlib as pbd
 from pbdlib import LQR
 from pbdlib.utils import get_canonical
 import matplotlib.pyplot as plt
+import torch
 
 def RK4(func, X0, u, t, type=None):
     """
@@ -240,7 +241,7 @@ class Robot:
         self.time = np.arange(0,N)
         self.robot = robot # PyBullet instance
         
-    def isCollisionHappened(self, traj, margin):
+    def hasCollisionHappened(self, traj, margin):
         table_height = .9 + .9*margin # To take bad control into account
         
         for i in range(traj.shape[1]):
@@ -314,15 +315,483 @@ class Robot:
             self.desired_ddq[j,:,:] = us.T
         
     def toStateSpace(self, q, dq, u):
-        self.X = np.empty(shape=[self.nb_traj,self.nb_S,self.N])
+        self.X = torch.empty([self.nb_traj,self.nb_S,q.shape[2]])
         
-        self.X[:,0:np.int(self.nb_S/2),:] = q
-        self.X[:,np.int(self.nb_S/2):,:] = dq
-        self.U = u
+        self.X[:,0:np.int(self.nb_S/2),:] = torch.tensor(q)
+        self.X[:,np.int(self.nb_S/2):,:] = torch.tensor(dq)
+        self.U = torch.tensor(u)
         
-        self.dX = np.diff(self.X)
-        self.dU = np.diff(self.U)
+        self.dX = torch.diff(self.X)
+        self.dU = torch.diff(self.U)
+        
+class HAVOK:
+    """
+    Hankel Alternative View Of Koopman
+    Step 1 : learn SVD time-embedded coordinate system
+    Step 2 : learn linear DMD model of the dynamics within this coordinate system
+    Step 3 : plan LQR gains for controlling original non-linear system in a linear fashion
+    """
+    def __init__(self, X, U, **kwargs):
+        self.X = X
+        self.U = U
+        self.N = X.shape[1] # Total number of points
+        self.nb_S = X.shape[0] # Number of states
+        self.kwargs = kwargs
+        if 'learnOnDiff' in kwargs: self.N += 1 # Learn on differences
+        if len(self.U.shape) == 1: self.nb_U = 1
+        else: self.nb_U = self.U.shape[0] # Number of control inputs
+        
+    def HANKEL(self, horizon, delay_spacing=None):
+        self.n_h = horizon # Number of points in one trajectory
+        self.spacing = delay_spacing
+        if delay_spacing is not None: s = delay_spacing
+        else: s = 1
+        #########################################################################
+        self.H = torch.empty([self.nb_S*self.n_h,self.N-self.n_h*s])
+        for i in range(self.n_h):
+            self.H[self.nb_S*i:self.nb_S*(i+1),:] = self.X[:,s*i:self.N - self.n_h*s + s*i]
+#         self.Un = np.empty(shape=[self.nb_U*self.n_h,self.N-self.n_h*s])
+#         for i in range(self.n_h):
+#             self.Un[self.nb_S*i,:] = np.zeros(shape=[1,self.N-self.n_h*s])
+#             self.Un[self.nb_S*i + 1,:] = self.U[s*i:self.N - self.n_h*s + s*i]
+#         for i in range(self.n_h):
+#             self.Un[self.nb_U*i,:] = self.U[s*i:self.N - self.n_h*s + s*i]
+            
+    def SVD(self, tau):
+        # Perform SVD ###########################################################
+        self.tau = tau # Number of embedded delays desired
+        self.u, self.s, self.vh = torch.linalg.svd(self.H)
+        self.sigma = self.s
+        self.v = self.vh.T
+        # Restrict to desired subspace ##########################################
+        self.u, self.s, self.v = self.u[:,:self.tau], self.s[:self.tau], self.v[:,:self.tau]
+        self.Y = self.v.T
+        self.C = self.u[:self.nb_S,:]@torch.diag(self.s) 
+        self.pinvC = torch.linalg.pinv(self.C).to(torch.float)
+        # Project u from R^n to R^r using SVD modes projection matrix ###########
+#         self.S = self.u@np.diag(self.s) # Projection matrix from R^r to R^n
+#         self.P = inv(self.S.T@self.S)@self.S.T
+#         self.Ur = self.P@self.Un # Input matrix evolving within subspace
+#         self.Cu = self.U[:self.N - self.n_h*self.spacing]@self.Ur.T@inv(self.Ur@self.Ur.T)
+#         self.Cu = self.Cu[:,np.newaxis].T
+        
+    def LS(self, p, rcond=None):
+        Y_cut = self.Y[:,:-1]
+        
+        if 'mode' in self.kwargs:
+            if self.kwargs['mode'] == 'prediction':
+                self.YU = torch.cat((Y_cut,
+                                     self.U[:,:Y_cut.shape[1]]),axis=0)
+                Y = self.Y[:,1:]
+                AB, self.res, _, _ = torch.linalg.lstsq(self.YU.T.to(torch.float),Y.T,rcond)
+                AB = AB.T
+                self.A, self.B = AB[:,:self.tau], AB[:,self.tau:]
+        else:
+            if self.nb_U == 1:
+                self.YU = torch.cat((Y_cut,self.U[:Y_cut.shape[1],None].T), axis=0)
+            else:
+                self.YU = torch.cat((Y_cut,self.U[:,:Y_cut.shape[1]]), axis=0)
+    #         self.YU = np.concatenate((Y_cut,self.Ur[:,:Y_cut.shape[1]]), axis=0)
+    #         U2 = np.concatenate((np.zeros(shape=[1,Y_cut.shape[1]]),self.U[:Y_cut.shape[1],np.newaxis].T),axis=0)
+    #         self.YU = np.concatenate((Y_cut,slg.pinv2(self.C)@U2), axis=0)
+                Y = self.Y[:,1:self.Y.shape[1]]
+                AB, self.res, _, _ = torch.linalg.lstsq(self.YU.T.to(torch.float),Y.T,rcond)
+                AB = AB.T
+        #         self.LS_residuals(AB)
+                self.A, self.B = AB[:,:self.tau], AB[:,self.tau:AB.shape[1]]
+        
+    def Simulate(self, X0, U_testing=None, **kwargs):
+        if U_testing is None: U = self.U
+        else: U = U_testing
+        X0 = X0.to(torch.float)
+        U = U.to(torch.float)
+        Y0 = self.pinvC@X0
+        N = torch.eye(self.tau) - self.pinvC @ self.C # Nullspace projection operator
+        Y0 = Y0 + N @ (self.Y[:,0] - Y0).to(torch.float) # Corresponding position in subspace
+
+        self.Y_traj = torch.empty([self.tau,self.N])
+        self.Y_traj[:,0] = Y0
+        
+        if 'mode' in self.kwargs:
+            if self.kwargs['mode'] is 'prediction':
+                for i in range(self.N-1):
+                    self.Y_traj[:,i+1] = self.A @ self.Y_traj[:,i] + self.B @ U[:,i]
+                
+            elif self.kwargs['mode'] == 'prediction_i':
+                self.Y_traj = self.A@torch.cat((Y0[:,None].to(torch.float),
+                                                kwargs['delta_U_i'].to(torch.float)),axis=0)+ self.B@U
+                self.X_traj = self.C@self.Y_traj
+                return self.X_traj
+        else:
+            for i in range(self.N-1):
+                if self.nb_U == 1:
+                    self.Y_traj[:,i+1] = self.A@self.Y_traj[:,i] + self.B[:,None].T*U[i]
+                else:
+                    self.Y_traj[:,i+1] = self.A@self.Y_traj[:,i] + self.B@U[:,i]
+        self.X_traj = self.C@self.Y_traj # Project trajectory back to original space
+        
+    def TrajError(self,X):
+        self.traj_error = torch.sqrt(np.sum(np.square(X - self.X_traj),axis=1))
+        
+    def LS_residuals(self, AB):
+        self.residuals = (AB@self.YU - self.Y[:,1:self.Y.shape[1]])@(AB@self.YU - self.Y[:,1:self.Y.shape[1]]).T
+        
+    def ConstructLQR(self, x_std, u_std, dt, ref, **kwargs):
+        self.u_std, self.x_std = u_std, x_std
+        # To perform every operation with numpy
+        self.A, self.B, self.C = self.A.numpy(), self.B.numpy(), self.C.numpy()
+        self.pinvC = self.pinvC.numpy()
+        
+        if 'via_points' in kwargs: # Via-points
+            reference = ref
+            precision = kwargs["precision"]
+            N = ref.shape[0]
+        elif 'disturbance' in kwargs:
+            N = self.N-1
+            reference = np.zeros([N,self.nb_S])
+            if len(ref) == 1:
+                reference[:,0] = ref 
+            else:
+                reference = ref
+        else:
+            N = self.N
+            reference = np.zeros([N,self.nb_S])
+            if len(ref) == 1:
+                reference[:,0] = ref 
+            else:
+                reference = ref
+            
+#         A_tilda = np.eye(self.A.shape[0]+1)
+#         A_tilda[:self.A.shape[0],:self.A.shape[0]] = self.A
+#         self.B_tilda = np.concatenate((self.B,np.zeros([1,1])),axis=0)
+            
+        # Build LQR problem instanc
+        self.LQR = pbd.LQR(self.A, self.B, nb_dim=self.tau, dt=dt, horizon=N)
+#         self.LQR = pbd.LQR(A_tilda, self.B_tilda, nb_dim=self.tau+1, dt=dt, horizon=len(ref))
+
+        self.LQR.z = (self.pinvC@reference).T
+#         self.LQR.z = np.zeros([N,self.tau + 1])
+
+        # Trajectory timing (1 via-point = 1 time-step, should be as long as the horizon)
+        seq_tracking = 1*[0]
+
+        for i in range(1,N):
+            seq_tracking += (1)*[i]
+
+        self.LQR.seq_xi = seq_tracking
+
+        # Control precision 
+        self.LQR.gmm_u = u_std
+
+        # Tracking precision
+        Q_tracking = np.empty([N,self.tau,self.tau])
+#         self.Q_tracking = np.empty(shape=[N,self.tau + 1,self.tau + 1])
+#         self.C_tilda = np.concatenate((np.concatenate((self.C,np.zeros(shape=[1,self.C.shape[1]])),axis=0),
+#                                        np.concatenate((np.zeros(shape=[self.C.shape[0],1]),np.ones([1,1])),axis=0)),axis=1)
+
+        for i in range(N):
+            if 'via_points' in kwargs:
+                cost = precision[:,i]
+            else:
+                cost = x_std
+            Q_tracking[i,:,:] = self.C.T@np.diag(cost)@self.C # Put zero velocity precision
+#             current_ref = reference[i,:,np.newaxis]
+#             ref_ref_T = current_ref@current_ref.T
+#             cost_matrix = np.concatenate((np.concatenate((inv(np.diag(cost)) + ref_ref_T,current_ref),axis=1),
+#                                                np.concatenate((current_ref.T,np.ones([1,1])),axis=1)),axis=0)
+#             self.Q_tracking[i,:,:] = self.C_tilda.T@cost_matrix@self.C_tilda # Put zero velocity precision
+
+        self.LQR.Q = Q_tracking
+        if 'disturbance' in kwargs:
+            self.LQR.ricatti(kwargs['disturbance'])
+        else:
+            self.LQR.ricatti()
+        
+    def LQR_simulate(self, X0, **kwargs):
+        self.Y = self.Y.numpy()
+        N = np.eye(self.tau) - self.pinvC@self.C # Nullspace projection operator
+        Y0 = np.zeros((1,self.tau))
+        Y0[0,:] = self.pinvC@X0 + N@(self.Y[:,0] - self.pinvC@X0)
+        
+#         X0 = np.concatenate((X0,np.ones([1])))
+#         N = np.eye(self.tau + 1) - pinv(self.C_tilda)@self.C_tilda # Nullspace projection operator
+#         Y0 = np.zeros((1,self.tau + 1))
+#         Y0[0,:] = pinv(self.C_tilda)@X0 + N@(np.concatenate((self.Y[:,0],np.ones([1]))) - pinv(self.C_tilda)@X0)
+
+#         Y0[0,:] = np.concatenate((self.Y[:,0],np.ones([1])))
+#         return self.LQR.make_rollout_w_dist(Y0, kwargs['disturbance'])
+        if 'disturbance' in kwargs:
+            ys, self.LQR_U = self.LQR.make_rollout_w_dist(Y0, kwargs['disturbance'])
+        else:
+            ys, self.LQR_U = self.LQR.make_rollout(Y0)
+        xs = self.C@ys[0,:,:].T # Map back to original space
+        self.LQR_X = xs
+        
+        
+    def LQR_cost(self, X, U, ref, horizon=None):
+        if horizon is not None: N = horizon
+        else: N = self.N
+            
+        Qu = torch.diag(torch.ones(N-1)*self.u_std)
+        Q_tracking_modified = self.LQR.Q[:,0:self.nb_S-1,0:self.nb_S-1]
+        
+        cost_X = 0
+        for i in range(N):
+            cost_X += (X[0,i] - ref[i]).T*Q_tracking_modified[i,0,0]*(X[0,i] - ref[i])
+        
+        self.J = U.T@Qu@U + cost_X
+        self.xQx, self.uRu = cost_X, U.T@Qu@U
+        return self.J
     
+    def RMSE(self, X_pred, X_true, **kwargs):
+        delta_X_norm = torch.linalg.norm(X_true - X_pred, ord=2, dim=0)
+        X_true_norm = torch.linalg.norm(X_true, ord=2, dim=0)
+        if 'regulation' in kwargs: X_true_norm = np.ones(1)
+        return 100*delta_X_norm.sum()/X_true_norm.sum()
+    
+    def toCuda(self, X):
+        if torch.cuda.is_available():
+            return X.to(torch.device('cuda'))
+        else:
+            return X
+    
+    def toCPU(self, X):
+        return X.to(torch.device('cpu'))
+    
+class SLFC:
+    """
+    Subspace learning for control
+    """
+    def __init__(self, X, U, **kwargs):
+        self.X = X
+        self.U = U
+        self.N = X.shape[1] # Total number of points
+        self.kwargs = kwargs
+        if 'learnOnDiff' in kwargs: self.N += 1 # Learn on differences
+        self.nb_S = X.shape[0] # Number of states
+        if len(self.U.shape) == 1: self.nb_U = 1
+        else: self.nb_U = self.U.shape[0] # Number of control inputs
+        
+    def delayEmbeddings(self, nx, nu, d):
+        self.X_lift = torch.empty([self.nb_S*nx + self.nb_U*nu - 1 + 1,
+                                      self.N - max(nx,nu)*d])
+#         for i in range(nx):
+#             self.X_lift[self.nb_S*i:self.nb_S*(i+1),:] = self.X[:,
+#                                                                d*i:self.N - max(nx,nu)*d + d*i]
+#         for i in range(nu):
+#             self.X_lift[nx*self.nb_S + i,:] = self.U[d*i:self.N - max(nx,nu)*d + d*i]
+
+        for i in range(nx):
+            self.X_lift[self.nb_S*i:self.nb_S*(i+1),:] = self.X[:,
+                                                               d*i:self.N - max(nx,nu)*d + d*i]
+        for i in range(1,nu):
+            self.X_lift[nx*self.nb_S + self.nb_U*i:nx*self.nb_S + self.nb_U*(i+1),:] = self.U[:,d*i:self.N - max(nx,nu)*d + d*i]
+            
+        # Observable : norm of the input vector
+        self.X_lift[nx*self.nb_S + nu*self.nb_U - 1,:] = torch.norm(torch.cat((self.X[:,:self.N - max(nx,nu)*d],
+                                                  self.U[:,:self.N - max(nx,nu)*d]),axis=0),p=2)
+        
+#         self.X_lift[nx*self.nb_S + nu*self.nb_U ,:] = np.ones(shape=[1,self.N - max(nx,nu)*d])
+            
+        # Defining the inputs of the regression problem
+        self.X_lift_plus = self.X_lift[:,1:]
+        self.X_lift = self.X_lift[:,:self.X_lift.shape[1]-1]
+        
+    def EDMD(self):
+        """
+        Extended dynamics mode decomposition
+        """
+        self.lift_dim = self.X_lift.shape[0]
+        N = self.X_lift.shape[1]
+        if 'mode' in self.kwargs:
+            if self.kwargs['mode'] is 'prediction':
+                XU = torch.cat((self.X_lift,
+                                self.U[:,:N]), # Contains X^m, delta_U and U^m
+                               axis=0).to(torch.float)
+                AB = self.X_lift_plus@torch.linalg.pinv(XU)
+                self.A = AB[:,:AB.shape[0]] # Autonomous system
+                self.B = AB[:,AB.shape[0]:] # Forcing terms
+        
+        self.C = torch.zeros([self.nb_S,self.lift_dim])
+        self.C[:,:self.nb_S] = torch.eye(self.nb_S)
+        self.pinvC = torch.linalg.pinv(self.C)
+        
+    def Simulate(self, X0, U, **kwargs):
+        N = self.N
+        Y0 = self.pinvC@X0
+        N_ = torch.eye(self.lift_dim) - self.pinvC @ self.C # Nullspace projection operator
+        Y0 = Y0 + N_ @ (self.X_lift[:,0] - Y0) # Corresponding position in subspace
+        #######################################
+        self.X_sim_lift = torch.empty(size=[self.lift_dim,N])
+        self.X_sim_lift[:,0] = Y0
+        if 'mode' in self.kwargs:
+            if self.kwargs['mode'] is 'prediction':
+                for i in range(N-1):
+                    self.X_sim_lift[:,i+1] = self.A@self.X_sim_lift[:,i] + self.B@U[:,i]
+        else:
+            for i in range(N-1):
+                self.X_sim_lift[:,i+1] = self.A@self.X_sim_lift[:,i] + self.B[:,None].T*U[i]
+        self.X_sim = self.C@self.X_sim_lift
+        
+    def ConstructLQR(self, x_std, u_std, dt, ref, **kwargs):
+        self.A, self.B, self.C, self.pinvC = self.A.numpy(), self.B.numpy(), self.C.numpy(), self.pinvC.numpy()
+        self.u_std, self.x_std = u_std, x_std
+        
+        if len(kwargs) == 1: # Via-points
+            reference = ref
+            precision = kwargs["precision"]
+            N = ref.shape[0]
+        else:
+            N = self.N
+            reference = np.zeros([N,self.nb_S])
+            if len(ref) == 1:
+                reference[:,0] = ref 
+            else:
+                reference = ref
+            
+        # Build LQR problem instance
+        self.LQR = pbd.LQR(self.A, self.B, nb_dim=self.lift_dim, dt=dt, horizon=N)
+
+        self.LQR.z = (self.pinvC@reference).T
+
+        # Trajectory timing (1 via-point = 1 time-step, should be as long as the horizon)
+        seq_tracking = 1*[0]
+
+        for i in range(1,N):
+            seq_tracking += (1)*[i]
+
+        self.LQR.seq_xi = seq_tracking
+
+        # Control precision 
+        self.LQR.gmm_u = u_std
+
+        # Tracking precision
+        Q_tracking = np.empty(shape=[N,self.lift_dim,self.lift_dim])
+
+        for i in range(N):
+            if len(kwargs) == 2:
+                cost = custom_precision[:,i]
+            else:
+                cost = x_std
+            Q_tracking[i,:,:] = self.C.T@np.diag(cost)@self.C # Put zero velocity precision
+
+        self.LQR.Q = Q_tracking
+        self.LQR.ricatti()
+        self.K_lift = self.LQR.K
+        self.K = self.K_lift@self.pinvC
+        
+    def LQR_simulate(self, X0):
+        N = np.eye(self.lift_dim) - self.pinvC@self.C # Nullspace projection operator
+        X0_lift = np.zeros((1,self.lift_dim))
+        X0_lift[0,:] = self.pinvC@X0 + N@(self.X_lift[:,0].numpy() - self.pinvC@X0)
+        ys, self.LQR_U = self.LQR.make_rollout(X0_lift)
+        xs = self.C@ys[0,:,:].T # Map back to original space
+        self.LQR_X = xs
+
+    def LQR_cost(self, X, U, ref, *args):
+        if len(args) == 1:
+            N = args[0]
+        else:
+            N = self.N
+
+        Qu = np.diag(np.ones(N-1)*self.u_std)
+        Q_tracking_modified = self.LQR.Q[:,0:self.nb_S-1,0:self.nb_S-1]
+
+        cost_X = 0
+        for i in range(N):
+            cost_X += (X[0,i] - ref[i]).T*Q_tracking_modified[i,0,0]*(X[0,i] - ref[i])
+
+        self.J = U.T@Qu@U + cost_X
+        self.xQx, self.uRu = cost_X, U.T@Qu@U
+        return self.J
+    
+    def RMSE(self, X_pred, X_true, **kwargs):
+        delta_X_norm = torch.linalg.norm(X_true - X_pred, ord=2, dim=0)
+        X_true_norm = torch.linalg.norm(X_true, ord=2, dim=0)
+        if 'regulation' in kwargs: X_true_norm = np.ones(1)
+        return 100*delta_X_norm.sum()/X_true_norm.sum()
+            
+class LQR_Transform:
+    """
+    Facilitates the transformation of a delay-embedded system into a LQR
+    form
+    """
+    def __init__(self,dynamics_instance,object_instance):
+        self.tau = dynamics_instance.tau
+        self.nb_states = dynamics_instance.nb_S
+        self.A_before, self.B_before = dynamics_instance.A, dynamics_instance.B
+        self.A, self.B = np.zeros(shape=[2*self.tau,2*self.tau]), np.zeros(shape=[2*self.tau])
+        self.dynamics, self.object = dynamics_instance, object_instance
+        
+    def LQR_Instance(self):
+        self.A[0:2,:], self.A[2:2*self.tau,0:2*self.tau-2] = self.A_before, np.eye(2*self.tau-2)
+        self.B[0:2] = self.B_before[0]
+        self.B = self.B[:,np.newaxis]
+        self.LQR = pbd.LQR(self.A, self.B, nb_dim=self.A.shape[0], dt=self.object.dt, horizon=self.object.N)
+        
+    def LQR_setParameters(self,u_std,x_std):
+        self.LQR_trackingTrajectory()
+        self.LQR_costDefinition(u_std,x_std)
+        
+    def LQR_trackingTrajectory(self):
+        # Trajectory for tracking
+        tracking_traj = np.zeros(shape=[self.object.N,2*self.tau]) # Vector for storing the trajectory
+        tracking_traj[:,0] = self.object.ref
+        self.LQR.z = tracking_traj
+
+        # Trajectory timing (1 via-point = 1 time-step, should be as long as the horizon)
+        seq_tracking = 1*[0]
+
+        for i in range(1,self.object.N):
+            seq_tracking += (1)*[i]
+
+        self.LQR.seq_xi = seq_tracking
+        
+    def LQR_costDefinition(self,u_std,x_std):
+        # Control precision 
+        self.u_std = u_std
+        self.LQR.gmm_u = u_std
+
+        # Tracking precision
+        Q_tracking = np.zeros(shape=[self.object.N,2*self.tau,2*self.tau])
+
+        for i in range(self.object.N):
+            Q_tracking[i,0:2,0:2] = np.diag([x_std,0]) # Put zero velocity precision
+
+        self.LQR.Q = Q_tracking
+        
+    def LQR_rollout(self,X0):
+        xs, us = self.LQR.make_rollout(X0)
+        self.X = np.mean(xs, axis=0)
+        self.us = np.mean(us, axis=0)
+        self.xs_std  = np.std(xs, axis=0)
+        
+    def LQR_cost(self,X,U,ref):
+        Qu = np.diag(np.ones(self.dynamics.N-1)*self.u_std)
+        Q_tracking_modified = self.LQR.Q[:,0:self.nb_states-1,0:self.nb_states-1]
+        
+        cost_X = 0
+        for i in range(self.dynamics.N):
+            cost_X += (X[0,i] - ref[i]).T*Q_tracking_modified[i,0,0]*(X[0,i] - ref[i])
+        
+        self.J = U.T@Qu@U + cost_X
+        return self.J
+    
+    def LQR_getK(self):
+        self.K = np.array(self.LQR.K)[:,0,:]
+        
+def plot_robot(xs, color='k', xlim=None,ylim=None, **kwargs):
+
+	l = plt.plot(xs[0,:], xs[1,:], marker='o', color=color, lw=10, mfc='w', solid_capstyle='round',
+			 **kwargs)
+
+	plt.axes().set_aspect('equal')
+
+	if xlim is not None: plt.xlim(xlim)
+	if ylim is not None: plt.ylim(ylim)
+
+	return l
+
 class DelayedLeastSquare:
     """
     Defines a delay embedded version of a least square problem
@@ -407,410 +876,3 @@ class DelayedLeastSquare:
     def computeResiduals(self):
         self.residuals[0] = np.sum(np.square(self.Y.T[:,0] - self.Phi.T@self.X.T[:,0])) # Position residuals
         self.residuals[1] = np.sum(np.square(self.Y.T[:,1] - self.Phi.T@self.X.T[:,1])) # Velocity residuals
-        
-class HAVOK:
-    """
-    Hankel Alternative View Of Koopman
-    Step 1 : learn SVD time-embedded coordinate system
-    Step 2 : learn linear DMD model of the dynamics within this coordinate system
-    Step 3 : plan LQR gains for controlling original non-linear system in a linear fashion
-    """
-    def __init__(self, X, U, **kwargs):
-        self.X = X
-        self.U = U
-        self.N = X.shape[1] # Total number of points
-        if len(kwargs) == 1: self.N += 1
-        self.nb_S = X.shape[0] # Number of states
-        if len(self.U.shape) == 1: self.nb_U = 1
-        else: self.nb_U = self.U.shape[0] # Number of control inputs
-        
-    def HANKEL(self, horizon, delay_spacing=None):
-        self.n_h = horizon # Number of points in one trajectory
-        self.spacing = delay_spacing
-        if delay_spacing is not None: s = delay_spacing
-        else: s = 1
-        #########################################################################
-        self.H = np.empty(shape=[self.nb_S*self.n_h,self.N-self.n_h*s])
-        for i in range(self.n_h):
-            self.H[self.nb_S*i:self.nb_S*(i+1),:] = self.X[:,s*i:self.N - self.n_h*s + s*i]
-#         self.Un = np.empty(shape=[self.nb_U*self.n_h,self.N-self.n_h*s])
-#         for i in range(self.n_h):
-#             self.Un[self.nb_S*i,:] = np.zeros(shape=[1,self.N-self.n_h*s])
-#             self.Un[self.nb_S*i + 1,:] = self.U[s*i:self.N - self.n_h*s + s*i]
-#         for i in range(self.n_h):
-#             self.Un[self.nb_U*i,:] = self.U[s*i:self.N - self.n_h*s + s*i]
-            
-    def SVD(self, tau):
-        # Perform SVD ###########################################################
-        self.tau = tau # Number of embedded delays desired
-        self.u, self.s, self.vh = svd(self.H, full_matrices=False)
-        self.sigma = self.s
-        self.v = self.vh.T
-        # Restrict to desired subspace ##########################################
-        self.u, self.s, self.v = self.u[:,:self.tau], self.s[:self.tau], self.v[:,:self.tau]
-        self.Y = self.v.T
-        self.C = self.u[0:self.nb_S,:]@np.diag(self.s) 
-        self.pinvC = slg.pinv2(self.C)
-        # Project u from R^n to R^r using SVD modes projection matrix ###########
-#         self.S = self.u@np.diag(self.s) # Projection matrix from R^r to R^n
-#         self.P = inv(self.S.T@self.S)@self.S.T
-#         self.Ur = self.P@self.Un # Input matrix evolving within subspace
-#         self.Cu = self.U[:self.N - self.n_h*self.spacing]@self.Ur.T@inv(self.Ur@self.Ur.T)
-#         self.Cu = self.Cu[:,np.newaxis].T
-        
-    def LS(self, p, rcond=None):
-        Y_cut = self.Y[:,:self.Y.shape[1]-1]
-        if self.nb_U == 1:
-            self.YU = np.concatenate((Y_cut,self.U[:Y_cut.shape[1],np.newaxis].T), axis=0)
-        else:
-            self.YU = np.concatenate((Y_cut,self.U[:,:Y_cut.shape[1]]), axis=0)
-#         self.YU = np.concatenate((Y_cut,self.Ur[:,:Y_cut.shape[1]]), axis=0)
-#         U2 = np.concatenate((np.zeros(shape=[1,Y_cut.shape[1]]),self.U[:Y_cut.shape[1],np.newaxis].T),axis=0)
-#         self.YU = np.concatenate((Y_cut,slg.pinv2(self.C)@U2), axis=0)
-        Y = self.Y[:,1:self.Y.shape[1]]
-        AB, self.res, _, _ = lstsq(self.YU.T,Y.T,rcond)
-        AB = AB.T
-        self.LS_residuals(AB)
-        self.A, self.B = AB[:,:self.tau], AB[:,self.tau:AB.shape[1]]
-        
-    def Simulate(self, X0, U_testing=None):
-        if U_testing is None: U = self.U
-        else: U = U_testing
-        Y0 = self.pinvC@X0
-        N = np.eye(self.tau) - self.pinvC @ self.C # Nullspace projection operator
-        Y0 = Y0 + N @ (self.Y[:,0] - Y0) # Corresponding position in subspace
-
-        self.Y_traj = np.empty(shape=[self.tau,self.N])
-        self.Y_traj[:,0] = Y0
-        for i in range(self.N-1):
-            if self.nb_U == 1:
-                self.Y_traj[:,i+1] = self.A@self.Y_traj[:,i] + self.B[:,np.newaxis].T*U[i]
-            else:
-                self.Y_traj[:,i+1] = self.A@self.Y_traj[:,i] + self.B@U[:,i]
-        self.X_traj = self.C@self.Y_traj
-        
-    def TrajError(self,X):
-        self.traj_error = np.sqrt(np.sum(np.square(X - self.X_traj),axis=1))
-        
-    def LS_residuals(self, AB):
-        self.residuals = (AB@self.YU - self.Y[:,1:self.Y.shape[1]])@(AB@self.YU - self.Y[:,1:self.Y.shape[1]]).T
-        
-    def ConstructLQR(self, x_std, u_std, dt, ref, **kwargs):
-        self.u_std, self.x_std = u_std, x_std
-        
-        if len(kwargs) == 1: # Via-points
-            reference = ref
-            precision = kwargs["precision"]
-            N = ref.shape[0]
-        else:
-            N = self.N
-            reference = np.zeros([N,self.nb_S])
-            if len(ref.shape) == 1:
-                reference[:,0] = ref 
-            else:
-                reference = ref
-            
-#         A_tilda = np.eye(self.A.shape[0]+1)
-#         A_tilda[:self.A.shape[0],:self.A.shape[0]] = self.A
-#         self.B_tilda = np.concatenate((self.B,np.zeros([1,1])),axis=0)
-            
-        # Build LQR problem instance
-        self.LQR = pbd.LQR(self.A, self.B, nb_dim=self.tau, dt=dt, horizon=N)
-#         self.LQR = pbd.LQR(A_tilda, self.B_tilda, nb_dim=self.tau+1, dt=dt, horizon=len(ref))
-
-        self.LQR.z = (self.pinvC@reference).T
-#         self.LQR.z = np.zeros([N,self.tau + 1])
-
-        # Trajectory timing (1 via-point = 1 time-step, should be as long as the horizon)
-        seq_tracking = 1*[0]
-
-        for i in range(1,N):
-            seq_tracking += (1)*[i]
-
-        self.LQR.seq_xi = seq_tracking
-
-        # Control precision 
-        self.LQR.gmm_u = u_std
-
-        # Tracking precision
-        Q_tracking = np.empty(shape=[N,self.tau,self.tau])
-#         self.Q_tracking = np.empty(shape=[N,self.tau + 1,self.tau + 1])
-#         self.C_tilda = np.concatenate((np.concatenate((self.C,np.zeros(shape=[1,self.C.shape[1]])),axis=0),
-#                                        np.concatenate((np.zeros(shape=[self.C.shape[0],1]),np.ones([1,1])),axis=0)),axis=1)
-
-        for i in range(N):
-            if len(kwargs) == 1:
-                cost = precision[:,i]
-            else:
-                cost = x_std
-            Q_tracking[i,:,:] = self.C.T@np.diag(cost)@self.C # Put zero velocity precision
-#             current_ref = reference[i,:,np.newaxis]
-#             ref_ref_T = current_ref@current_ref.T
-#             cost_matrix = np.concatenate((np.concatenate((inv(np.diag(cost)) + ref_ref_T,current_ref),axis=1),
-#                                                np.concatenate((current_ref.T,np.ones([1,1])),axis=1)),axis=0)
-#             self.Q_tracking[i,:,:] = self.C_tilda.T@cost_matrix@self.C_tilda # Put zero velocity precision
-        self.LQR.Q = Q_tracking
-        self.LQR.ricatti()
-        
-    def LQR_simulate(self, X0):
-        N = np.eye(self.tau) - self.pinvC@self.C # Nullspace projection operator
-        Y0 = np.zeros((1,self.tau))
-        Y0[0,:] = self.pinvC@X0 + N@(self.Y[:,0] - self.pinvC@X0)
-        
-#         X0 = np.concatenate((X0,np.ones([1])))
-#         N = np.eye(self.tau + 1) - pinv(self.C_tilda)@self.C_tilda # Nullspace projection operator
-#         Y0 = np.zeros((1,self.tau + 1))
-#         Y0[0,:] = pinv(self.C_tilda)@X0 + N@(np.concatenate((self.Y[:,0],np.ones([1]))) - pinv(self.C_tilda)@X0)
-
-#         Y0[0,:] = np.concatenate((self.Y[:,0],np.ones([1])))
-        
-        ys, self.LQR_U = self.LQR.make_rollout(Y0)
-        xs = self.C@ys[0,:,:].T # Map back to original space
-        self.LQR_X = xs
-        
-        
-    def LQR_cost(self, X, U, ref, horizon=None):
-        if horizon is not None: N = horizon
-        else: N = self.N
-            
-        Qu = np.diag(np.ones(N-1)*self.u_std)
-        Q_tracking_modified = self.LQR.Q[:,0:self.nb_S-1,0:self.nb_S-1]
-        
-        cost_X = 0
-        for i in range(N):
-            cost_X += (X[0,i] - ref[i]).T*Q_tracking_modified[i,0,0]*(X[0,i] - ref[i])
-        
-        self.J = U.T@Qu@U + cost_X
-        self.xQx, self.uRu = cost_X, U.T@Qu@U
-        return self.J
-    
-    def RMSE(self, X_pred, X_true, **kwargs):
-        delta_X_norm = lg.norm(X_true - X_pred, ord=2, axis=0)
-        X_true_norm = lg.norm(X_true, ord=2, axis=0)
-        if len(kwargs) == 1: X_true_norm = np.ones(1)
-        return 100*delta_X_norm.sum()/X_true_norm.sum()
-    
-class SLFC:
-    """
-    Subspace learning for control
-    """
-    def __init__(self, X, U):
-        self.X = X
-        self.U = U
-        self.N = X.shape[1] # Total number of points
-        self.nb_S = X.shape[0] # Number of states
-        self.nb_U = 1 # Number of control inputs
-        
-    def delayEmbeddings(self, nx, nu, d=1):
-        self.X_lift = np.empty(shape=[self.nb_S*nx + self.nb_U*nu - 1 + 1,
-                                      self.N - max(nx,nu)*d])
-#         for i in range(nx):
-#             self.X_lift[self.nb_S*i:self.nb_S*(i+1),:] = self.X[:,
-#                                                                d*i:self.N - max(nx,nu)*d + d*i]
-#         for i in range(nu):
-#             self.X_lift[nx*self.nb_S + i,:] = self.U[d*i:self.N - max(nx,nu)*d + d*i]
-
-        for i in range(nx):
-            self.X_lift[self.nb_S*i:self.nb_S*(i+1),:] = self.X[:,
-                                                               d*i:self.N - max(nx,nu)*d + d*i]
-        for i in range(1,nu):
-            self.X_lift[nx*self.nb_S + i,:] = self.U[d*i:self.N - max(nx,nu)*d + d*i]
-            
-        self.X_lift[nx*self.nb_S + nu*self.nb_U - 1,:] = slg.norm(np.concatenate((self.X[:,:self.N - max(nx,nu)*d],
-                                                  self.U[:self.N - max(nx,nu)*d,np.newaxis].T),axis=0))
-        
-#         self.X_lift[nx*self.nb_S + nu*self.nb_U ,:] = np.ones(shape=[1,self.N - max(nx,nu)*d])
-            
-        # Defining the inputs of the regression problem
-        self.X_lift_plus = self.X_lift[:,1:]
-        self.X_lift = self.X_lift[:,:self.X_lift.shape[1]-1]
-        
-    def EDMD(self):
-        """
-        Extended dynamics mode decomposition
-        """
-        self.lift_dim = self.X_lift.shape[0]
-        XU = np.concatenate((self.X_lift,self.U[:self.X_lift.shape[1],np.newaxis].T),axis=0)
-        AB = self.X_lift_plus@slg.pinv2(XU)
-        self.A = AB[:,:AB.shape[1]-1]
-        self.B = AB[:,AB.shape[1]-1]
-        self.B = self.B[:,np.newaxis]
-        self.C = np.zeros(shape=[self.nb_S,self.lift_dim])
-        self.C[:,:self.nb_S] = np.eye(self.nb_S)
-        
-        self.loss = np.sum(np.square((self.X_lift_plus - AB@XU).T@(self.X_lift_plus - AB@XU)))
-        
-    def Simulate(self, X, U):
-        N = X.shape[1]
-        X0 = X[:,0]
-        Y0 = pinv(self.C)@X0
-#         N_ = np.eye(self.lift_dim) - pinv(self.C) @ self.C # Nullspace projection operator
-#         Y0 = Y0 + N_ @ (self.X_lift[:,0] - Y0) # Corresponding position in subspace
-        #######################################
-        self.X_sim_lift = np.empty(shape=[self.lift_dim,N])
-        self.X_sim_lift[:,0] = Y0
-        for i in range(N-1):
-            self.X_sim_lift[:,i+1] = self.A@self.X_sim_lift[:,i] + self.B[:,np.newaxis].T*U[i]
-        self.X_sim = self.C@self.X_sim_lift
-              
-    def trajLoss(self, X, Xp):
-        """
-        Sum of square errors of the trajectory w.r.t. reference trajectory
-        """
-        self.traj_loss = np.sqrt(np.sum(np.square((X - Xp).T@(X - Xp))))
-        
-    def ConstructLQR(self, x_std, u_std, dt, ref, *args):
-        self.u_std, self.x_std = u_std, x_std
-        if len(args) == 2:
-            reference = args[0]
-            custom_precision = args[1]
-            N = reference.shape[1]
-        else:
-            N = self.N
-            reference = np.zeros([N,self.nb_S])
-            reference[:,0] = ref 
-            
-        # Build LQR problem instance
-        self.LQR = pbd.LQR(self.A, self.B, nb_dim=self.lift_dim, dt=dt, horizon=len(ref))
-
-        self.LQR.z = (pinv(self.C)@reference.T).T
-
-        # Trajectory timing (1 via-point = 1 time-step, should be as long as the horizon)
-        seq_tracking = 1*[0]
-
-        for i in range(1,N):
-            seq_tracking += (1)*[i]
-
-        self.LQR.seq_xi = seq_tracking
-
-        # Control precision 
-        self.LQR.gmm_u = u_std
-
-        # Tracking precision
-        x_std = 1e6 # Importance of tracking the position
-        Q_tracking = np.empty(shape=[N,self.lift_dim,self.lift_dim])
-
-        for i in range(N):
-            if len(args) == 2:
-                cost = custom_precision[:,i]
-            else:
-                cost = np.array([x_std,0])
-            Q_tracking[i,:,:] = self.C.T@np.diag(cost)@self.C # Put zero velocity precision
-
-        self.LQR.Q = Q_tracking
-        self.LQR.ricatti()
-        self.K_lift = self.LQR.K
-        self.K = self.K_lift@pinv(self.C)
-        
-    def LQR_simulate(self, X0):
-        N = np.eye(self.lift_dim) - pinv(self.C)@self.C # Nullspace projection operator
-        X0_lift = np.zeros((1,self.lift_dim))
-        X0_lift[0,:] = pinv(self.C)@X0 + N@(self.X_lift[:,0] - pinv(self.C)@X0)
-        ys, self.LQR_U = self.LQR.make_rollout(X0_lift)
-        ys_mean = np.mean(ys, axis=0)
-        xs = self.C@ys_mean.T # Map back to original space
-        xs = xs.T
-        self.LQR_X = xs
-
-    def LQR_cost(self, X, U, ref, *args):
-        if len(args) == 1:
-            N = args[0]
-        else:
-            N = self.N
-
-        Qu = np.diag(np.ones(N-1)*self.u_std)
-        Q_tracking_modified = self.LQR.Q[:,0:self.nb_S-1,0:self.nb_S-1]
-
-        cost_X = 0
-        for i in range(N):
-            cost_X += (X[0,i] - ref[i]).T*Q_tracking_modified[i,0,0]*(X[0,i] - ref[i])
-
-        self.J = U.T@Qu@U + cost_X
-        self.xQx, self.uRu = cost_X, U.T@Qu@U
-        return self.J
-    
-    def RMSE(self, X_pred, X_true):
-        delta_X_norm = lg.norm(X_true - X_pred, ord=2, axis=0)
-        X_true_norm = lg.norm(X_true, ord=2, axis=0)
-        return 100*delta_X_norm.sum()/X_true_norm.sum()
-            
-class LQR_Transform:
-    """
-    Facilitates the transformation of a delay-embedded system into a LQR
-    form
-    """
-    def __init__(self,dynamics_instance,object_instance):
-        self.tau = dynamics_instance.tau
-        self.nb_states = dynamics_instance.nb_S
-        self.A_before, self.B_before = dynamics_instance.A, dynamics_instance.B
-        self.A, self.B = np.zeros(shape=[2*self.tau,2*self.tau]), np.zeros(shape=[2*self.tau])
-        self.dynamics, self.object = dynamics_instance, object_instance
-        
-    def LQR_Instance(self):
-        self.A[0:2,:], self.A[2:2*self.tau,0:2*self.tau-2] = self.A_before, np.eye(2*self.tau-2)
-        self.B[0:2] = self.B_before[0]
-        self.B = self.B[:,np.newaxis]
-        self.LQR = pbd.LQR(self.A, self.B, nb_dim=self.A.shape[0], dt=self.object.dt, horizon=self.object.N)
-        
-    def LQR_setParameters(self,u_std,x_std):
-        self.LQR_trackingTrajectory()
-        self.LQR_costDefinition(u_std,x_std)
-        
-    def LQR_trackingTrajectory(self):
-        # Trajectory for tracking
-        tracking_traj = np.zeros(shape=[self.object.N,2*self.tau]) # Vector for storing the trajectory
-        tracking_traj[:,0] = self.object.ref
-        self.LQR.z = tracking_traj
-
-        # Trajectory timing (1 via-point = 1 time-step, should be as long as the horizon)
-        seq_tracking = 1*[0]
-
-        for i in range(1,self.object.N):
-            seq_tracking += (1)*[i]
-
-        self.LQR.seq_xi = seq_tracking
-        
-    def LQR_costDefinition(self,u_std,x_std):
-        # Control precision 
-        self.u_std = u_std
-        self.LQR.gmm_u = u_std
-
-        # Tracking precision
-        Q_tracking = np.zeros(shape=[self.object.N,2*self.tau,2*self.tau])
-
-        for i in range(self.object.N):
-            Q_tracking[i,0:2,0:2] = np.diag([x_std,0]) # Put zero velocity precision
-
-        self.LQR.Q = Q_tracking
-        
-    def LQR_rollout(self,X0):
-        xs, us = self.LQR.make_rollout(X0)
-        self.X = np.mean(xs, axis=0)
-        self.us = np.mean(us, axis=0)
-        self.xs_std  = np.std(xs, axis=0)
-        
-    def LQR_cost(self,X,U,ref):
-        Qu = np.diag(np.ones(self.dynamics.N-1)*self.u_std)
-        Q_tracking_modified = self.LQR.Q[:,0:self.nb_states-1,0:self.nb_states-1]
-        
-        cost_X = 0
-        for i in range(self.dynamics.N):
-            cost_X += (X[0,i] - ref[i]).T*Q_tracking_modified[i,0,0]*(X[0,i] - ref[i])
-        
-        self.J = U.T@Qu@U + cost_X
-        return self.J
-    
-    def LQR_getK(self):
-        self.K = np.array(self.LQR.K)[:,0,:]
-        
-def plot_robot(xs, color='k', xlim=None,ylim=None, **kwargs):
-
-	l = plt.plot(xs[0,:], xs[1,:], marker='o', color=color, lw=10, mfc='w', solid_capstyle='round',
-			 **kwargs)
-
-	plt.axes().set_aspect('equal')
-
-	if xlim is not None: plt.xlim(xlim)
-	if ylim is not None: plt.ylim(ylim)
-
-	return l
