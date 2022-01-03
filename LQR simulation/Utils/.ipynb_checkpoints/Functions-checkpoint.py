@@ -8,6 +8,8 @@ from pbdlib import LQR
 from pbdlib.utils import get_canonical
 import matplotlib.pyplot as plt
 import torch
+import tensorly as tl
+tl.set_backend('pytorch')
 
 def RK4(func, X0, u, t, type=None):
     """
@@ -20,7 +22,7 @@ def RK4(func, X0, u, t, type=None):
         dt = t[1] - t[0]
         nt = len(t)
     X  = np.empty([len(X0), nt])
-    X[:,0] = X0
+    X[:,0] = X0[0,0]
     
     if type == 'controller':
         for i in range(nt-1):
@@ -30,12 +32,11 @@ def RK4(func, X0, u, t, type=None):
             k4 = func(X[:,i] + dt    * k3, u(X, i))
             X[:,i+1] = X[:,i] + dt / 6. * (k1 + 2. * k2 + 2. * k3 + k4)
     elif type == 'controller-step-by-step':
-        for i in range(nt-1):
-            k1 = func(X0, u)
-            k2 = func(X0 + dt/2. * k1, u)
-            k3 = func(X0 + dt/2. * k2, u)
-            k4 = func(X0 + dt    * k3, u)
-            X = X0 + dt / 6. * (k1 + 2. * k2 + 2. * k3 + k4)
+        k1 = func(X0, u)
+        k2 = func(X0 + dt/2. * k1, u)
+        k3 = func(X0 + dt/2. * k2, u)
+        k4 = func(X0 + dt    * k3, u)
+        X = X0 + dt / 6. * (k1 + 2. * k2 + 2. * k3 + k4)
     else:
         for i in range(nt-1):
             k1 = func(X[:,i], u[i])
@@ -192,18 +193,40 @@ class SimplePendulum:
     """
     Defines a simple pendulum object
     """
-    def __init__(self, mass, length, time, X0, dt=1e-2):
+    def __init__(self, mass, length, time, X0=None, dt=1e-2, nu=.5, k=.5):
         self.m = mass
         self.l = length
         self.g = 9.81
         self.T = time
+        self.nu, self.k = nu, k
+        self.M = self.l**2*self.m
         self.N = len(self.T)
         self.X, self.X0 = np.empty(shape=[2,self.N]), X0
         self.X[:,0], self.X_ref2 = X0, np.empty(shape=[self.N,2])
         self.U, self.U2 = np.empty(self.N-1), np.empty(self.N-1)
         self.dt = dt
+        self.x = None
         
     ref, dX, dU = None, None, None
+    
+    def Physics(self, x, tau):
+        x1 = x[0] 
+        x2 = x[1] 
+        dx1dt = x2 
+        dx2dt = 1/(self.M)* ( -self.m*self.g*self.l*np.cos(x1) - 
+                                         self.k*x1 - 
+                                         self.nu*x2 +
+                                         tau
+                            )
+        return np.array([dx1dt,dx2dt])
+    
+    def CTC(self, qddot_desired, u, gravity=True, stiffness=True, friction=True):
+        tau = self.M* ( qddot_desired + 
+                        self.m*self.g*np.cos(self.x[0])*gravity -
+                        u ) + (
+                        self.k*self.x[0]*stiffness + 
+                        self.nu*self.x[1]*friction )
+        return tau
     
     def dynamics(self, theta, u):
         if isinstance(u, np.ndarray) == True:
@@ -231,7 +254,7 @@ class Robot:
     - Creates random trajectories for each joints while taking joint limits into account
     - Converts robot dynamics data into state-space form
     """
-    def __init__(self, n_joints, nu, dt, N, robot):
+    def __init__(self, n_joints, nu, dt, N, robot=None):
         self.nb_joints = n_joints
         self.nb_S = n_joints*2
         self.nb_U = nu
@@ -239,7 +262,8 @@ class Robot:
         self.dt = dt
         self.T = np.arange(0,N*dt,dt)
         self.time = np.arange(0,N)
-        self.robot = robot # PyBullet instance
+        if robot is not None:
+            self.robot = robot # PyBullet instance
         
     def hasCollisionHappened(self, traj, margin):
         table_height = .9 + .9*margin # To take bad control into account
@@ -266,7 +290,7 @@ class Robot:
         q_min, q_max = q_limits[:,0], q_limits[:,1]
         
         # LQR initialisation (double-integrator)
-        A,B = get_canonical(7,nb_deriv=2,dt=self.dt)
+        A,B = get_canonical(self.nb_joints,nb_deriv=2,dt=self.dt)
         lqr = LQR(A, B, dt=self.dt, horizon=self.N)
         lqr.gmm_u = -6.
         temp = np.zeros(self.nb_S) 
@@ -315,14 +339,21 @@ class Robot:
             self.desired_ddq[j,:,:] = us.T
         
     def toStateSpace(self, q, dq, u):
-        self.X = torch.empty([self.nb_traj,self.nb_S,q.shape[2]])
-        
-        self.X[:,0:np.int(self.nb_S/2),:] = torch.tensor(q)
-        self.X[:,np.int(self.nb_S/2):,:] = torch.tensor(dq)
-        self.U = torch.tensor(u)
-        
-        self.dX = torch.diff(self.X)
-        self.dU = torch.diff(self.U)
+        if len(q.shape) == 2:
+            self.X = torch.empty([self.nb_traj,self.nb_S,q.shape[1]])
+            
+            self.X[:,0,:] = torch.tensor(q)
+            self.X[:,1,:] = torch.tensor(dq)
+            self.U = torch.tensor(u)
+        else:
+            self.X = torch.empty([self.nb_traj,self.nb_S,q.shape[2]])
+
+            self.X[:,0:np.int(self.nb_S/2),:] = torch.tensor(q)
+            self.X[:,np.int(self.nb_S/2):,:] = torch.tensor(dq)
+            self.U = torch.tensor(u)
+
+            self.dX = torch.diff(self.X)
+            self.dU = torch.diff(self.U)
         
 class HAVOK:
     """
@@ -338,8 +369,10 @@ class HAVOK:
         self.nb_S = X.shape[0] # Number of states
         self.kwargs = kwargs
         if 'learnOnDiff' in kwargs: self.N += 1 # Learn on differences
-        if len(self.U.shape) == 1: self.nb_U = 1
-        else: self.nb_U = self.U.shape[0] # Number of control inputs
+        if 'nb_U' in kwargs: self.nb_U = kwargs['nb_U']
+        if 'nb_U_ex' in kwargs: self.nb_U_ex = kwargs['nb_U_ex']
+        self.nb_U_c = self.nb_U - self.nb_U_ex
+        self.to_numpy = False
         
     def HANKEL(self, horizon, delay_spacing=None):
         self.n_h = horizon # Number of points in one trajectory
@@ -360,13 +393,14 @@ class HAVOK:
     def SVD(self, tau):
         # Perform SVD ###########################################################
         self.tau = tau # Number of embedded delays desired
-        self.u, self.s, self.vh = torch.linalg.svd(self.H)
-        self.sigma = self.s
-        self.v = self.vh.T
+#         self.u, self.s, self.vh = torch.linalg.svd(self.H)
+#         self.sigma = self.s
+#         self.v = self.vh.T
         # Restrict to desired subspace ##########################################
-        self.u, self.s, self.v = self.u[:,:self.tau], self.s[:self.tau], self.v[:,:self.tau]
-        self.Y = self.v.T
-        self.C = self.u[0:self.nb_S,:]@torch.diag(self.s) 
+#         self.u, self.s, self.v = self.u[:,:self.tau], self.s[:self.tau], self.v[:,:self.tau]
+        self.u, self.s, self.v = tl.partial_svd(self.H, n_eigenvecs=self.tau)
+        self.Y = self.v
+        self.C = self.u[:self.nb_S,:] @ torch.diag(self.s) 
         self.pinvC = torch.linalg.pinv(self.C).to(torch.float)
         # Project u from R^n to R^r using SVD modes projection matrix ###########
 #         self.S = self.u@np.diag(self.s) # Projection matrix from R^r to R^n
@@ -378,96 +412,89 @@ class HAVOK:
     def LS(self, p, rcond=None):
         Y_cut = self.Y[:,:-1]
         
-        if 'mode' in self.kwargs:
-            if self.kwargs['mode'] == 'prediction':
-                self.YU = torch.cat((Y_cut,
-                                     self.U[:,:Y_cut.shape[1]]),axis=0)
-                Y = self.Y[:,1:]
-                AB, self.res, _, _ = torch.linalg.lstsq(self.YU.T.to(torch.float),Y.T,rcond)
-                AB = AB.T
-                self.A, self.B = AB[:,:self.tau], AB[:,self.tau:]
-        else:
+        if self.kwargs['mode'] == 'prediction' or self.kwargs['mode'] == 'ELQR form':
             if self.nb_U == 1:
                 self.YU = torch.cat((Y_cut,self.U[:Y_cut.shape[1],None].T), axis=0)
             else:
-                self.YU = torch.cat((Y_cut,self.U[:,:Y_cut.shape[1]]), axis=0)
-    #         self.YU = np.concatenate((Y_cut,self.Ur[:,:Y_cut.shape[1]]), axis=0)
-    #         U2 = np.concatenate((np.zeros(shape=[1,Y_cut.shape[1]]),self.U[:Y_cut.shape[1],np.newaxis].T),axis=0)
-    #         self.YU = np.concatenate((Y_cut,slg.pinv2(self.C)@U2), axis=0)
-                Y = self.Y[:,1:self.Y.shape[1]]
-                AB, self.res, _, _ = torch.linalg.lstsq(self.YU.T.to(torch.float),Y.T,rcond)
-                AB = AB.T
-        #         self.LS_residuals(AB)
-                self.A, self.B = AB[:,:self.tau], AB[:,self.tau:AB.shape[1]]
+                self.YU = torch.cat((Y_cut,
+                                     self.U[:,:Y_cut.shape[1]]),axis=0)
+            Y = self.Y[:,1:]
+            AB, self.res, _, _ = torch.linalg.lstsq(self.YU.T.to(torch.float),Y.T,rcond)
+            AB = AB.T
+            if self.kwargs['mode'] == 'ELQR form':
+                self.A, self.Bd = AB[:,:self.tau], AB[:,self.tau:self.tau+self.nb_S+self.nb_U_c]
+                self.B = AB[:,self.tau+self.nb_S+self.nb_U_c:] # Input matrix
+            else:
+                self.A, self.B = AB[:,:self.tau], AB[:,self.tau:]
+        elif self.kwargs['mode'] == 'not dynamical':
+            Y = self.Y[:,1:]
+            self.B, _, _, _ = torch.linalg.lstlq(self.U.T.to(torch.float),Y.T,rcond)
         
-    def Simulate(self, X0, U_testing=None, **kwargs):
-        if U_testing is None: U = self.U
-        else: U = U_testing
+    def Simulate(self, X0, horizon, **kwargs):
+        if 'U' in kwargs: U = kwargs['U']
+        else: U = self.U
         X0 = X0.to(torch.float)
         U = U.to(torch.float)
-        Y0 = self.pinvC@X0
+        Y0 = self.pinvC @ X0
         N = torch.eye(self.tau) - self.pinvC @ self.C # Nullspace projection operator
         Y0 = Y0 + N @ (self.Y[:,0] - Y0).to(torch.float) # Corresponding position in subspace
 
-        self.Y_traj = torch.empty([self.tau,self.N])
-        self.Y_traj[:,0] = Y0
+        N = horizon
+        self.Y_prediction = torch.empty([self.tau,N])
+        self.Y_prediction[:,0] = Y0
         
-        if 'mode' in self.kwargs:
-            if self.kwargs['mode'] is 'prediction':
-                for i in range(self.N-1):
-                    self.Y_traj[:,i+1] = self.A @ self.Y_traj[:,i] + self.B @ U[:,i]
+        if self.kwargs['mode'] == 'prediction' or self.kwargs['mode'] == 'ELQR form':
+            for i in range(N-1):
+                if self.kwargs['mode'] == 'prediction':
+                    if self.nb_U == 1:
+                        self.Y_prediction[:,i+1] = self.A @ self.Y_prediction[:,i] + self.B[:,None].T*U[i]
+                    else:
+                        self.Y_prediction[:,i+1] = self.A @ self.Y_prediction[:,i] + self.B @ U[:,i]
+                elif self.kwargs['mode'] == 'ELQR form':
+                    self.Y_prediction[:,i+1] = self.A @ self.Y_prediction[:,i] + torch.cat((self.Bd[:],
+                                                                                          self.B),axis=1) @ U[:,i]
+        elif self.kwargs['mode'] == 'prediction_i':
+            self.Y_prediction = self.A @ torch.cat((Y0[:,None].to(torch.float),
+                                            kwargs['delta_U_i'].to(torch.float)),axis=0)+ self.B @ U
+            self.X_prediction = self.C @ self.Y_prediction
+            return self.X_traj
+        elif self.kwargs['mode'] == 'not dynamical':
+            for i in range(N-1):
+                self.Y_prediction[:,i+1] = self.B @ U[:,i]
                 
-            elif self.kwargs['mode'] == 'prediction_i':
-                self.Y_traj = self.A@torch.cat((Y0[:,None].to(torch.float),
-                                                kwargs['delta_U_i'].to(torch.float)),axis=0)+ self.B@U
-                self.X_traj = self.C@self.Y_traj
-                return self.X_traj
-        else:
-            for i in range(self.N-1):
-                if self.nb_U == 1:
-                    self.Y_traj[:,i+1] = self.A@self.Y_traj[:,i] + self.B[:,None].T*U[i]
-                else:
-                    self.Y_traj[:,i+1] = self.A@self.Y_traj[:,i] + self.B@U[:,i]
-        self.X_traj = self.C@self.Y_traj # Project trajectory back to original space
+        self.X_prediction = self.C @ self.Y_prediction # Project trajectory back to original space
         
     def TrajError(self,X):
         self.traj_error = torch.sqrt(np.sum(np.square(X - self.X_traj),axis=1))
         
     def LS_residuals(self, AB):
-        self.residuals = (AB@self.YU - self.Y[:,1:self.Y.shape[1]])@(AB@self.YU - self.Y[:,1:self.Y.shape[1]]).T
+        self.residuals = (AB @ self.YU - self.Y[:,1:self.Y.shape[1]]) @ (AB @ self.YU - self.Y[:,1:self.Y.shape[1]]).T
         
-    def ConstructLQR(self, x_std, u_std, dt, ref, **kwargs):
+    def toNumpy(self):
+        if not self.to_numpy:
+            self.A, self.B, self.Bd, self.C, self.pinvC = self.A.numpy(), self.B.numpy(), self.Bd.numpy(), self.C.numpy(), self.pinvC.numpy()
+            self.to_numpy = True
+        
+    def ConstructLQR(self, x_std, u_std, dt, horizon, ref=None, **kwargs):
         self.u_std, self.x_std = u_std, x_std
-        # To perform every operation with numpy
-        self.A, self.B, self.C = self.A.numpy(), self.B.numpy(), self.C.numpy()
-        self.pinvC = self.pinvC.numpy()
         
-        if 'via_points' in kwargs: # Via-points
+        if kwargs['mode'] == 'via-points': # Via-points
             reference = ref
             precision = kwargs["precision"]
-            N = ref.shape[0]
-        elif 'disturbance' in kwargs:
-            N = self.N-1
-            reference = np.zeros([N,self.nb_S])
-            if len(ref) == 1:
-                reference[:,0] = ref 
-            else:
-                reference = ref
+            N = horizon
+        elif kwargs['mode'] == 'ELQR':
+            N = horizon-1 # Because of the ELQR formulation
+            reference = np.zeros([N,self.nb_S]).T # Drive the residual dynamics to 0
         else:
-            N = self.N
+            N = horizon
             reference = np.zeros([N,self.nb_S])
             if len(ref) == 1:
                 reference[:,0] = ref 
             else:
                 reference = ref
             
-#         A_tilda = np.eye(self.A.shape[0]+1)
-#         A_tilda[:self.A.shape[0],:self.A.shape[0]] = self.A
-#         self.B_tilda = np.concatenate((self.B,np.zeros([1,1])),axis=0)
-            
-        # Build LQR problem instanc
+        # Build LQR problem instance
         self.LQR = pbd.LQR(self.A, self.B, nb_dim=self.tau, dt=dt, horizon=N)
-#         self.LQR = pbd.LQR(A_tilda, self.B_tilda, nb_dim=self.tau+1, dt=dt, horizon=len(ref))
 
         self.LQR.z = (self.pinvC@reference).T
 #         self.LQR.z = np.zeros([N,self.tau + 1])
@@ -485,33 +512,24 @@ class HAVOK:
 
         # Tracking precision
         Q_tracking = np.empty([N,self.tau,self.tau])
-#         self.Q_tracking = np.empty(shape=[N,self.tau + 1,self.tau + 1])
-#         self.C_tilda = np.concatenate((np.concatenate((self.C,np.zeros(shape=[1,self.C.shape[1]])),axis=0),
-#                                        np.concatenate((np.zeros(shape=[self.C.shape[0],1]),np.ones([1,1])),axis=0)),axis=1)
 
         for i in range(N):
-            if 'via_points' in kwargs:
+            if kwargs['mode'] == 'via-points':
                 cost = precision[:,i]
             else:
                 cost = x_std
             Q_tracking[i,:,:] = self.C.T@np.diag(cost)@self.C # Put zero velocity precision
-#             current_ref = reference[i,:,np.newaxis]
-#             ref_ref_T = current_ref@current_ref.T
-#             cost_matrix = np.concatenate((np.concatenate((inv(np.diag(cost)) + ref_ref_T,current_ref),axis=1),
-#                                                np.concatenate((current_ref.T,np.ones([1,1])),axis=1)),axis=0)
-#             self.Q_tracking[i,:,:] = self.C_tilda.T@cost_matrix@self.C_tilda # Put zero velocity precision
 
         self.LQR.Q = Q_tracking
-        if 'disturbance' in kwargs:
-            self.LQR.ricatti(kwargs['disturbance'])
+        if kwargs['mode'] == 'ELQR':
+            self.LQR.ricatti(mode='ELQR', u_d=kwargs['u_d'], Bd=kwargs['Bd'])
         else:
             self.LQR.ricatti()
         
     def LQR_simulate(self, X0, **kwargs):
-        self.Y = self.Y.numpy()
         N = np.eye(self.tau) - self.pinvC@self.C # Nullspace projection operator
         Y0 = np.zeros((1,self.tau))
-        Y0[0,:] = self.pinvC@X0 + N@(self.Y[:,0] - self.pinvC@X0)
+        Y0[0,:] = self.pinvC@X0 + N@(self.Y[:,0].numpy() - self.pinvC@X0)
         
 #         X0 = np.concatenate((X0,np.ones([1])))
 #         N = np.eye(self.tau + 1) - pinv(self.C_tilda)@self.C_tilda # Nullspace projection operator
@@ -520,8 +538,8 @@ class HAVOK:
 
 #         Y0[0,:] = np.concatenate((self.Y[:,0],np.ones([1])))
 #         return self.LQR.make_rollout_w_dist(Y0, kwargs['disturbance'])
-        if 'disturbance' in kwargs:
-            ys, self.LQR_U = self.LQR.make_rollout_w_dist(Y0, kwargs['disturbance'])
+        if kwargs['mode'] == 'ELQR':
+            ys, self.LQR_U = self.LQR.make_rollout_w_dist(Y0, u_d=kwargs['u_d'], Bd=kwargs['Bd'])
         else:
             ys, self.LQR_U = self.LQR.make_rollout(Y0)
         xs = self.C@ys[0,:,:].T # Map back to original space
@@ -604,7 +622,7 @@ class SLFC:
         self.lift_dim = self.X_lift.shape[0]
         N = self.X_lift.shape[1]
         if 'mode' in self.kwargs:
-            if self.kwargs['mode'] is 'prediction':
+            if self.kwargs['mode'] == 'prediction':
                 XU = torch.cat((self.X_lift,
                                 self.U[:,:N]), # Contains X^m, delta_U and U^m
                                axis=0).to(torch.float)
@@ -625,7 +643,7 @@ class SLFC:
         self.X_sim_lift = torch.empty(size=[self.lift_dim,N])
         self.X_sim_lift[:,0] = Y0
         if 'mode' in self.kwargs:
-            if self.kwargs['mode'] is 'prediction':
+            if self.kwargs['mode'] == 'prediction':
                 for i in range(N-1):
                     self.X_sim_lift[:,i+1] = self.A@self.X_sim_lift[:,i] + self.B@U[:,i]
         else:
