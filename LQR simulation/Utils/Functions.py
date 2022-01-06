@@ -220,10 +220,9 @@ class SimplePendulum:
                             )
         return np.array([dx1dt,dx2dt])
     
-    def CTC(self, qddot_desired, u, gravity=True, stiffness=True, friction=True):
-        tau = self.M* ( qddot_desired + 
-                        self.m*self.g*np.cos(self.x[0])*gravity -
-                        u ) + (
+    def CTC(self, qddot_desired, u, gravity=True, stiffness=True, friction=True, inertia=True):
+        tau = self.M* ( qddot_desired  -
+                        u ) * inertia + self.m*self.g*np.cos(self.x[0])*gravity + (
                         self.k*self.x[0]*stiffness + 
                         self.nu*self.x[1]*friction )
         return tau
@@ -362,17 +361,18 @@ class HAVOK:
     Step 2 : learn linear DMD model of the dynamics within this coordinate system
     Step 3 : plan LQR gains for controlling original non-linear system in a linear fashion
     """
-    def __init__(self, X, U, **kwargs):
-        self.X = X
-        self.U = U
-        self.N = X.shape[1] # Total number of points
-        self.nb_S = X.shape[0] # Number of states
-        self.kwargs = kwargs
-        if 'learnOnDiff' in kwargs: self.N += 1 # Learn on differences
-        if 'nb_U' in kwargs: self.nb_U = kwargs['nb_U']
-        if 'nb_U_ex' in kwargs: self.nb_U_ex = kwargs['nb_U_ex']
-        self.nb_U_c = self.nb_U - self.nb_U_ex
-        self.to_numpy = False
+    def __init__(self, X=None, U=None, **kwargs):
+        if X is not None:
+            self.X = X
+            self.U = U
+            self.N = X.shape[1] # Total number of points
+            self.nb_S = X.shape[0] # Number of states
+            self.kwargs = kwargs
+            if 'learnOnDiff' in kwargs: self.N += 1 # Learn on differences
+            if 'nb_U' in kwargs: self.nb_U = kwargs['nb_U']
+            if 'nb_U_ex' in kwargs: self.nb_U_ex = kwargs['nb_U_ex']
+            self.nb_U_c = self.nb_U - self.nb_U_ex
+            self.to_numpy = False
         
     def HANKEL(self, horizon, delay_spacing=None):
         self.n_h = horizon # Number of points in one trajectory
