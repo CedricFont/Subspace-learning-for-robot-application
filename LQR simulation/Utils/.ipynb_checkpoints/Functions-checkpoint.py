@@ -431,34 +431,43 @@ class HAVOK:
             self.B, _, _, _ = torch.linalg.lstlq(self.U.T.to(torch.float),Y.T,rcond)
         
     def Simulate(self, X0, horizon, **kwargs):
+        if self.to_numpy is True:
+            self.toTorch()
         if 'U' in kwargs: U = kwargs['U']
         else: U = self.U
-        X0 = X0.to(torch.float)
-        U = U.to(torch.float)
-        Y0 = self.pinvC @ X0
-        N = torch.eye(self.tau) - self.pinvC @ self.C # Nullspace projection operator
-        Y0 = Y0 + N @ (self.Y[:,0] - Y0).to(torch.float) # Corresponding position in subspace
-
+        if 'mode' in kwargs:
+            if kwargs['mode'] == 'step-wise':
+                self.kwargs['mode'] = 'step-wise'
         N = horizon
         self.Y_prediction = torch.empty([self.tau,N])
-        self.Y_prediction[:,0] = Y0
         
-        if self.kwargs['mode'] == 'prediction' or self.kwargs['mode'] == 'ELQR form':
+        if X0 is not None:
+            X0 = X0.to(torch.float)
+            U = U.to(torch.float)
+            Y0 = self.pinvC @ X0
+            N_ = torch.eye(self.tau) - self.pinvC @ self.C # Nullspace projection operator
+            Y0 = Y0 + N_ @ (self.Y[:,0] - Y0).to(torch.float) # Corresponding position in subspace
+            self.Y_prediction[:,0] = Y0
+        
+        if self.kwargs['mode'] == 'prediction' or self.kwargs['mode'] == 'ELQR form' or self.kwargs['mode'] == 'step-wise':
             for i in range(N-1):
-                if self.kwargs['mode'] == 'prediction':
+                if self.kwargs['mode'] == 'prediction': # Standard model with a state vector and an input
                     if self.nb_U == 1:
                         self.Y_prediction[:,i+1] = self.A @ self.Y_prediction[:,i] + self.B[:,None].T*U[i]
                     else:
                         self.Y_prediction[:,i+1] = self.A @ self.Y_prediction[:,i] + self.B @ U[:,i]
-                elif self.kwargs['mode'] == 'ELQR form':
+                elif self.kwargs['mode'] == 'ELQR form': # Includes exogenous input Ud
                     self.Y_prediction[:,i+1] = self.A @ self.Y_prediction[:,i] + torch.cat((self.Bd[:],
-                                                                                          self.B),axis=1) @ U[:,i]
-        elif self.kwargs['mode'] == 'prediction_i':
+                                                                                            self.B),axis=1) @ U[:,i]
+                elif self.kwargs['mode'] == 'step-wise': # only predicts one step forward, hence should perform better
+                    self.Y_prediction[:,i+1] = self.A @ self.pinvC @ kwargs['delta_X'][:,i] + torch.cat((self.Bd[:],
+                                                                                                         self.B),axis=1) @ U[:,i]
+        elif self.kwargs['mode'] == 'prediction_i': # Not recursive
             self.Y_prediction = self.A @ torch.cat((Y0[:,None].to(torch.float),
                                             kwargs['delta_U_i'].to(torch.float)),axis=0)+ self.B @ U
             self.X_prediction = self.C @ self.Y_prediction
             return self.X_traj
-        elif self.kwargs['mode'] == 'not dynamical':
+        elif self.kwargs['mode'] == 'not dynamical': # Does not updates recursively state-wise
             for i in range(N-1):
                 self.Y_prediction[:,i+1] = self.B @ U[:,i]
                 
@@ -474,9 +483,16 @@ class HAVOK:
         if not self.to_numpy:
             self.A, self.B, self.Bd, self.C, self.pinvC = self.A.numpy(), self.B.numpy(), self.Bd.numpy(), self.C.numpy(), self.pinvC.numpy()
             self.to_numpy = True
+    
+    def toTorch(self):
+        if self.to_numpy:
+            self.A, self.B, self.Bd, self.C, self.pinvC = torch.tensor(self.A), torch.tensor(self.B), torch.tensor(self.Bd), torch.tensor(self.C), torch.tensor(self.pinvC)
+            self.to_numpy = False
         
     def ConstructLQR(self, x_std, u_std, dt, horizon, ref=None, **kwargs):
         self.u_std, self.x_std = u_std, x_std
+        if self.to_numpy is False:
+            self.toNumpy()
         
         if kwargs['mode'] == 'via-points': # Via-points
             reference = ref
@@ -530,14 +546,6 @@ class HAVOK:
         N = np.eye(self.tau) - self.pinvC@self.C # Nullspace projection operator
         Y0 = np.zeros((1,self.tau))
         Y0[0,:] = self.pinvC@X0 + N@(self.Y[:,0].numpy() - self.pinvC@X0)
-        
-#         X0 = np.concatenate((X0,np.ones([1])))
-#         N = np.eye(self.tau + 1) - pinv(self.C_tilda)@self.C_tilda # Nullspace projection operator
-#         Y0 = np.zeros((1,self.tau + 1))
-#         Y0[0,:] = pinv(self.C_tilda)@X0 + N@(np.concatenate((self.Y[:,0],np.ones([1]))) - pinv(self.C_tilda)@X0)
-
-#         Y0[0,:] = np.concatenate((self.Y[:,0],np.ones([1])))
-#         return self.LQR.make_rollout_w_dist(Y0, kwargs['disturbance'])
         if kwargs['mode'] == 'ELQR':
             ys, self.LQR_U = self.LQR.make_rollout_w_dist(Y0, u_d=kwargs['u_d'], Bd=kwargs['Bd'])
         else:
@@ -562,10 +570,12 @@ class HAVOK:
         return self.J
     
     def RMSE(self, X_pred, X_true, **kwargs):
+        if 'regulation' in kwargs: 
+            X_true_norm = torch.ones(1)
+            X_true = torch.zeros([X_pred.shape[0],X_pred.shape[1]])
         delta_X_norm = torch.linalg.norm(X_true - X_pred, ord=2, dim=0)
         X_true_norm = torch.linalg.norm(X_true, ord=2, dim=0)
-        if 'regulation' in kwargs: X_true_norm = np.ones(1)
-        return 100*delta_X_norm.sum()/X_true_norm.sum()
+        return 100*delta_X_norm.sum()/X_pred.shape[1]
     
     def toCuda(self, X):
         if torch.cuda.is_available():
