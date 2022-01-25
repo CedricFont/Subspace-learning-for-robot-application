@@ -13,16 +13,14 @@ tl.set_backend('pytorch')
 
 def RK4(func, X0, u, t, type=None):
     """
-    Runge and Kutta 4 integrator.
+    Runge Kutta 4 integrator.
     """
-    if isinstance(t, np.ndarray) == False:
+    if type == 'controller-step-by-step':
         dt = t
-        nt = 2
-    else :
-        dt = t[1] - t[0]
-        nt = len(t)
-    X  = np.empty([len(X0), nt])
-    X[:,0] = X0[0,0]
+        if len(X0.shape) == 1:
+            X = np.empty([X0.shape[0]])
+        else:
+            X = np.empty([X0.shape[0],X0.shape[1]])
     
     if type == 'controller':
         for i in range(nt-1):
@@ -247,6 +245,44 @@ class SimplePendulum:
         dx2dt = 2/(self.m*self.l**2)*(u - self.m*self.g*np.sin(x1))
         output[0:2] = np.array((dx1dt,dx2dt))
         return output
+    
+class DoublePendulum:
+    """
+    - Instanciantes 2D pendulum object
+    - Defines its dynamics and properties
+    """
+    def __init__(self, param):
+        self.l1, self.l2 = param['l1'], param['l2']
+        self.m1, self.m2 = param['m1'], param['m2']
+        self.T, self.dt = param['time'], param['dt']
+        self.N = len(self.T)
+        self.g = 9.81
+        self.x = None
+        
+    def Physics(self, x, tau=np.zeros([2])):
+        q1, q1_dot = x[0,0], x[0,1]
+        q2, q2_dot = x[1,0], x[1,1]
+        # Mass matrix computation
+        M_11 = self.m1*self.l1**2/3 + self.m2*self.l1**2 + self.m2*self.l2**2/3 + self.m2*self.l1*self.l2*np.cos(q2)
+        M_12 = self.m2*self.l2**2/3 + self.m2*self.l1*self.l2/2*np.cos(q2)
+        M_21 = M_12
+        M_22 = self.m2*self.l2**2/3
+        self.M = np.array([[M_11,M_12],[M_21,M_22]])
+        # Stiffness matrix computation
+        N_1 = - self.m2*self.l1*self.l2/2*np.sin(q2)*q2_dot**2 - self.m2*self.l1*self.l2*np.sin(q2)*q1_dot*q2_dot + self.m1*self.g*self.l1/2*np.cos(q1) + self.m2*self.g*self.l2/2*np.cos(q1-q2) + self.m2*self.g*self.l1*np.cos(q1)
+        N_2 = self.m2*self.l1*self.l2/2*np.sin(q2)*q1_dot**2 + self.m2*self.g*self.l2/2*np.cos(q1-q2)
+        self.Nq = np.array([[N_1],[N_2]])
+        # Joint torque vector
+        self.tau = tau
+        # Dynamics formulation
+        q_ddot = inv(self.M) @ (self.tau - self.Nq[:,0])
+        
+        return np.array([[q1_dot,q_ddot[0]],
+                         [q2_dot,q_ddot[1]]])
+    
+    def CTC(self, q_ddot_desired, u):
+        tau = self.M @ ( q_ddot_desired  + u ) + self.Nq[:,0]
+        return tau
     
 class Robot:
     """
@@ -481,12 +517,18 @@ class HAVOK:
         
     def toNumpy(self):
         if not self.to_numpy:
-            self.A, self.B, self.Bd, self.C, self.pinvC = self.A.numpy(), self.B.numpy(), self.Bd.numpy(), self.C.numpy(), self.pinvC.numpy()
+            if self.kwargs['mode'] == 'prediction':
+                self.A, self.B, self.C, self.pinvC = self.A.numpy(), self.B.numpy(), self.C.numpy(), self.pinvC.numpy()
+            else:
+                self.A, self.B, self.Bd, self.C, self.pinvC = self.A.numpy(), self.B.numpy(), self.Bd.numpy(), self.C.numpy(), self.pinvC.numpy()
             self.to_numpy = True
     
     def toTorch(self):
         if self.to_numpy:
-            self.A, self.B, self.Bd, self.C, self.pinvC = torch.tensor(self.A), torch.tensor(self.B), torch.tensor(self.Bd), torch.tensor(self.C), torch.tensor(self.pinvC)
+            if self.kwargs['mode'] == 'prediction':
+                self.A, self.B, self.C, self.pinvC = torch.tensor(self.A), torch.tensor(self.B), torch.tensor(self.C), torch.tensor(self.pinvC)
+            else:
+                self.A, self.B, self.Bd, self.C, self.pinvC = torch.tensor(self.A), torch.tensor(self.B), torch.tensor(self.Bd), torch.tensor(self.C), torch.tensor(self.pinvC)
             self.to_numpy = False
         
     def ConstructLQR(self, x_std, u_std, dt, horizon, ref=None, **kwargs):
@@ -543,6 +585,8 @@ class HAVOK:
             self.LQR.ricatti()
         
     def LQR_simulate(self, X0, **kwargs):
+        if self.to_numpy is False:
+            self.toNumpy()
         N = np.eye(self.tau) - self.pinvC@self.C # Nullspace projection operator
         Y0 = np.zeros((1,self.tau))
         Y0[0,:] = self.pinvC@X0 + N@(self.Y[:,0].numpy() - self.pinvC@X0)
@@ -570,12 +614,14 @@ class HAVOK:
         return self.J
     
     def RMSE(self, X_pred, X_true, **kwargs):
+        if isinstance(X_pred, np.ndarray): X_pred = torch.tensor(X_pred)
+        if isinstance(X_true, np.ndarray): X_true = torch.tensor(X_true)
         if 'regulation' in kwargs: 
             X_true_norm = torch.ones(1)
             X_true = torch.zeros([X_pred.shape[0],X_pred.shape[1]])
         delta_X_norm = torch.linalg.norm(X_true - X_pred, ord=2, dim=0)
         X_true_norm = torch.linalg.norm(X_true, ord=2, dim=0)
-        return 100*delta_X_norm.sum()/X_pred.shape[1]
+        return (100*delta_X_norm.sum()/X_pred.shape[1]).numpy()
     
     def toCuda(self, X):
         if torch.cuda.is_available():
